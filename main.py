@@ -1,1632 +1,1838 @@
-# taxi_calculator_overlay.py
-# One-file app: GTA 5 RP Taxi Calculator Overlay
-# UI styled like modern dashboard (dark sidebar + light cards)
-#
-# deps:
-#   pip install PySide6 matplotlib pynput
-#
-# run:
-#   python taxi_calculator_overlay.py
+"""
+Калькулятор таксиста (Desktop / Overlay) — Modern Premium UI (один файл .py)
+
+Требуется: PySide6
+pip install PySide6
+python taxi_calculator.py
+
+Обновления по вашим правкам:
+✅ Анимация кнопок — ТОЛЬКО при наведении (hover), а не всегда
+✅ Нижняя панель: "За всё время" + Доход / Расход / Чистая прибыль
+✅ Меньше подсказок (софт не «болтает»)
+✅ Операции смены — более профессиональный/удобный вывод (карточки, структура, аккуратные акценты)
+✅ Комментарий: есть пункт "Другое (ввести вручную)" (нельзя удалить в настройках)
+   - если выбран "Другое..." — появляется ввод комментария (InputDialog)
+✅ История — более современная подача:
+   - таблица слева
+   - справа “карточка деталей” (кратко и по делу)
+   - двойной клик открывает окно с подробностями
+✅ Шрифты/размеры/цвета — выровнены под современный UI (контраст, иерархия, меньше лишнего)
+
+Данные сохраняются в JSON (AppData).
+"""
 
 from __future__ import annotations
 
-import os
-import sys
-import sqlite3
-import threading
-import traceback
-from datetime import datetime, date, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+import json
+import uuid
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Dict, Any, Tuple
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import Qt, QTimer, QStandardPaths, QSize, QRectF
+from PySide6.QtGui import QFont, QAction, QCursor, QPainter, QLinearGradient, QColor, QPen
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QLineEdit,
+    QComboBox,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QStackedWidget,
+    QFrame,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QAbstractItemView,
+    QDialog,
+    QFormLayout,
+    QCheckBox,
+    QSpinBox,
+    QInputDialog,
+    QMenu,
+    QTextEdit,
+    QSplitter,
+)
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
 
-from pynput import keyboard as pynput_keyboard
+APP_NAME = "TaxiCalculatorOverlay"
+DATA_FILE = "taxi_calculator_data.json"
+
+OTHER_COMMENT_TEXT = "Другое (ввести вручную)"
+HEADER_INCOME = "Комментарий (доход)"
+HEADER_EXPENSE = "Комментарий (расход)"
 
 
-APP_NAME = "Калькулятор Таксиста"
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "taxi_calc.db")
+# ---------------------------
+# Utils
+# ---------------------------
+
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
-# ------------------------------- Utils -------------------------------
+def iso_to_dt(s: str) -> datetime:
+    return datetime.fromisoformat(s)
 
-def now_local() -> datetime:
-    return datetime.now()
 
-def fmt_money(x: float) -> str:
-    sign = "-" if x < 0 else ""
-    x = abs(x)
-    return f"{sign}{x:,.0f}".replace(",", " ")
+def dt_to_ymd(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d")
 
-def fmt_duration(seconds: int) -> str:
-    if seconds < 0:
-        seconds = 0
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    if h > 0:
-        return f"{h:d}ч {m:02d}м"
-    if m > 0:
-        return f"{m:d}м {s:02d}с"
-    return f"{s:d}с"
 
-def safe_float(text: str) -> Optional[float]:
-    t = text.strip().replace(" ", "").replace(",", ".")
+def pretty_date(ymd: str) -> str:
+    try:
+        d = datetime.strptime(ymd, "%Y-%m-%d").date()
+        return d.strftime("%d.%m.%Y")
+    except Exception:
+        return ymd
+
+
+def dt_to_pretty(dt: datetime) -> str:
+    return dt.strftime("%d.%m.%Y %H:%M")
+
+
+def dt_to_short(dt: datetime) -> str:
+    # компактнее для карточек операций
+    return dt.strftime("%d.%m %H:%M")
+
+
+def format_money(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
+
+
+def parse_amount(text: str) -> Optional[int]:
+    if text is None:
+        return None
+    t = text.strip().replace(" ", "").replace(",", "")
     if not t:
         return None
+    if t[0] == "-":
+        if len(t) == 1:
+            return None
+        if not t[1:].isdigit():
+            return None
+    else:
+        if not t.isdigit():
+            return None
     try:
-        return float(t)
+        return int(t)
     except Exception:
         return None
 
-def day_key(d: date) -> str:
-    return d.strftime("%d-%m-%Y")
 
-def parse_day_key(s: str) -> date:
-    return datetime.strptime(s, "%d-%m-%Y").date()
+def amount_color(amount: int) -> str:
+    return "#2EE6A6" if amount >= 0 else "#FF5B77"
 
 
-# ------------------------------- DB Layer -------------------------------
-
-class DB:
-    def __init__(self, path: str):
-        self.path = path
-        self._lock = threading.RLock()
-        self.conn = sqlite3.connect(self.path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self._init_schema()
-
-    def _exec(self, sql: str, params: Tuple[Any, ...] = ()) -> sqlite3.Cursor:
-        with self._lock:
-            cur = self.conn.cursor()
-            cur.execute(sql, params)
-            self.conn.commit()
-            return cur
-
-    def _query(self, sql: str, params: Tuple[Any, ...] = ()) -> List[sqlite3.Row]:
-        with self._lock:
-            cur = self.conn.cursor()
-            cur.execute(sql, params)
-            return cur.fetchall()
-
-    def _init_schema(self):
-        self._exec("PRAGMA journal_mode=WAL;")
-
-        self._exec("""
-        CREATE TABLE IF NOT EXISTS days (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            day_text TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL
-        );
-        """)
-
-        self._exec("""
-        CREATE TABLE IF NOT EXISTS shifts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            day_id INTEGER NOT NULL,
-            started_at TEXT NOT NULL,
-            ended_at TEXT,
-            status TEXT NOT NULL,
-            FOREIGN KEY(day_id) REFERENCES days(id) ON DELETE CASCADE
-        );
-        """)
-
-        self._exec("""
-        CREATE TABLE IF NOT EXISTS ops (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            shift_id INTEGER NOT NULL,
-            ts TEXT NOT NULL,
-            kind TEXT NOT NULL,      -- IN / OUT
-            amount REAL NOT NULL,
-            comment TEXT NOT NULL,
-            FOREIGN KEY(shift_id) REFERENCES shifts(id) ON DELETE CASCADE
-        );
-        """)
-
-        self._exec("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        """)
-
-        defaults = {
-            "hotkey_toggle": "<ctrl>+<alt>+h",
-            "hotkey_quick_income": "<ctrl>+<alt>+i",
-            "hotkey_quick_expense": "<ctrl>+<alt>+o",
-            "hotkey_screenshot": "<ctrl>+<alt>+p",
-            "ui_compact": "0",  # overlay compact mode
-        }
-        for k, v in defaults.items():
-            if self.get_setting(k) is None:
-                self.set_setting(k, v)
-
-        self.ensure_day(date.today())
-
-    def get_setting(self, key: str) -> Optional[str]:
-        rows = self._query("SELECT value FROM settings WHERE key=?", (key,))
-        return rows[0]["value"] if rows else None
-
-    def set_setting(self, key: str, value: str):
-        self._exec("""
-        INSERT INTO settings(key, value) VALUES(?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-        """, (key, value))
-
-    def ensure_day(self, d: date) -> int:
-        dtxt = day_key(d)
-        rows = self._query("SELECT id FROM days WHERE day_text=?", (dtxt,))
-        if rows:
-            return int(rows[0]["id"])
-        cur = self._exec("INSERT INTO days(day_text, created_at) VALUES(?, ?)", (dtxt, now_local().isoformat()))
-        return int(cur.lastrowid)
-
-    def list_days_desc(self) -> List[Tuple[int, str]]:
-        rows = self._query("SELECT id, day_text FROM days ORDER BY id DESC")
-        return [(int(r["id"]), str(r["day_text"])) for r in rows]
-
-    def get_day_id_by_text(self, day_text: str) -> Optional[int]:
-        rows = self._query("SELECT id FROM days WHERE day_text=?", (day_text,))
-        return int(rows[0]["id"]) if rows else None
-
-    def get_active_shift(self) -> Optional[sqlite3.Row]:
-        rows = self._query("""
-        SELECT s.*, d.day_text
-        FROM shifts s
-        JOIN days d ON d.id=s.day_id
-        WHERE s.status='ACTIVE'
-        ORDER BY s.id DESC
-        LIMIT 1
-        """)
-        return rows[0] if rows else None
-
-    def start_shift(self, day_id: int) -> int:
-        self._exec("UPDATE shifts SET status='CLOSED', ended_at=COALESCE(ended_at, ?) WHERE status='ACTIVE'", (now_local().isoformat(),))
-        cur = self._exec("INSERT INTO shifts(day_id, started_at, status) VALUES(?, ?, 'ACTIVE')", (day_id, now_local().isoformat()))
-        return int(cur.lastrowid)
-
-    def end_shift(self, shift_id: int):
-        self._exec("UPDATE shifts SET status='CLOSED', ended_at=? WHERE id=?", (now_local().isoformat(), shift_id))
-
-    def list_shifts_for_day(self, day_id: int) -> List[sqlite3.Row]:
-        return self._query("SELECT s.* FROM shifts s WHERE s.day_id=? ORDER BY s.id DESC", (day_id,))
-
-    def list_shifts_in_range(self, day_from: str, day_to: str) -> List[sqlite3.Row]:
-        days = self._query("SELECT id, day_text FROM days")
-        d_from = parse_day_key(day_from)
-        d_to = parse_day_key(day_to)
-        ids: List[int] = []
-        for r in days:
-            dt = parse_day_key(str(r["day_text"]))
-            if d_from <= dt <= d_to:
-                ids.append(int(r["id"]))
-        if not ids:
-            return []
-        placeholders = ",".join(["?"] * len(ids))
-        return self._query(f"""
-        SELECT s.*, d.day_text
-        FROM shifts s
-        JOIN days d ON d.id=s.day_id
-        WHERE s.day_id IN ({placeholders})
-        ORDER BY s.id DESC
-        """, tuple(ids))
-
-    def add_op(self, shift_id: int, kind: str, amount: float, comment: str):
-        self._exec("INSERT INTO ops(shift_id, ts, kind, amount, comment) VALUES(?, ?, ?, ?, ?)",
-                   (shift_id, now_local().isoformat(), kind, amount, comment))
-
-    def list_ops_for_shift(self, shift_id: int) -> List[sqlite3.Row]:
-        return self._query("SELECT * FROM ops WHERE shift_id=? ORDER BY id DESC", (shift_id,))
-
-    def sums_for_shift(self, shift_id: int) -> Tuple[float, float]:
-        rows = self._query("""
-        SELECT
-          SUM(CASE WHEN kind='IN' THEN amount ELSE 0 END) AS inc,
-          SUM(CASE WHEN kind='OUT' THEN amount ELSE 0 END) AS exp
-        FROM ops
-        WHERE shift_id=?
-        """, (shift_id,))
-        inc = float(rows[0]["inc"] or 0.0)
-        exp = float(rows[0]["exp"] or 0.0)
-        return inc, exp
-
-    def sums_for_day(self, day_id: int) -> Tuple[float, float, int]:
-        rows = self._query("""
-        SELECT
-          SUM(CASE WHEN o.kind='IN' THEN o.amount ELSE 0 END) AS inc,
-          SUM(CASE WHEN o.kind='OUT' THEN o.amount ELSE 0 END) AS exp
-        FROM shifts s
-        LEFT JOIN ops o ON o.shift_id=s.id
-        WHERE s.day_id=?
-        """, (day_id,))
-        inc = float(rows[0]["inc"] or 0.0)
-        exp = float(rows[0]["exp"] or 0.0)
-
-        shifts = self._query("SELECT started_at, ended_at, status FROM shifts WHERE day_id=?", (day_id,))
-        total_sec = 0
-        now = now_local()
-        for s in shifts:
-            st = datetime.fromisoformat(str(s["started_at"]))
-            en = datetime.fromisoformat(str(s["ended_at"])) if s["ended_at"] else now
-            total_sec += max(0, int((en - st).total_seconds()))
-        return inc, exp, total_sec
+def amount_soft_bg(amount: int) -> str:
+    return "rgba(46,230,166,0.10)" if amount >= 0 else "rgba(255,91,119,0.12)"
 
 
-# ------------------------------- UI Components -------------------------------
+# ---------------------------
+# Data model
+# ---------------------------
 
-class Card(QtWidgets.QFrame):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("Card")
-        self.setFrameShape(QtWidgets.QFrame.NoFrame)
-
-class MetricCard(Card):
-    def __init__(self, title: str, parent=None):
-        super().__init__(parent)
-        lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(16, 14, 16, 14)
-        lay.setSpacing(6)
-
-        self.title = QtWidgets.QLabel(title)
-        self.title.setObjectName("CardTitle")
-        self.value = QtWidgets.QLabel("—")
-        self.value.setObjectName("CardValue")
-        self.sub = QtWidgets.QLabel("")
-        self.sub.setObjectName("CardSub")
-
-        lay.addWidget(self.title)
-        lay.addWidget(self.value)
-        lay.addWidget(self.sub)
-
-    def set_value(self, text: str, sub: str = ""):
-        self.value.setText(text)
-        self.sub.setText(sub)
-
-class PillButton(QtWidgets.QPushButton):
-    def __init__(self, text: str, primary: bool = True, parent=None):
-        super().__init__(text, parent)
-        self.setObjectName("BtnPrimary" if primary else "BtnGhost")
-        self.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-
-class MplChart(FigureCanvas):
-    def __init__(self, parent=None):
-        self.fig = Figure(figsize=(6, 3), dpi=100)
-        super().__init__(self.fig)
-        self.setParent(parent)
-        self.ax = self.fig.add_subplot(111)
-        self.fig.tight_layout()
-
-    def clear(self):
-        self.fig.clf()
-        self.ax = self.fig.add_subplot(111)
-        self.fig.tight_layout()
-
-    def draw_bars(self, labels: List[str], inc: List[float], exp: List[float], profit: List[float]):
-        self.clear()
-        ax = self.ax
-        x = list(range(len(labels)))
-        w = 0.28
-        ax.bar([i - w for i in x], inc, width=w, label="Доход")
-        ax.bar(x, exp, width=w, label="Расход")
-        ax.bar([i + w for i in x], profit, width=w, label="Прибыль")
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=30, ha="right")
-        ax.grid(True, axis="y", alpha=0.25)
-        ax.legend(loc="upper left")
-        self.fig.tight_layout()
-        self.draw()
-
-    def draw_pie(self, labels: List[str], values: List[float], title: str):
-        self.clear()
-        ax = self.ax
-        if not values or sum(values) <= 0:
-            ax.text(0.5, 0.5, "Нет данных", ha="center", va="center")
-            ax.axis("off")
-            self.draw()
-            return
-        ax.pie(values, labels=labels, autopct=lambda p: f"{p:.0f}%" if p >= 5 else "")
-        ax.set_title(title)
-        self.fig.tight_layout()
-        self.draw()
+@dataclass
+class Operation:
+    id: str
+    ts: str
+    amount: int
+    comment: str
 
 
-class HotkeyCaptureDialog(QtWidgets.QDialog):
-    def __init__(self, current: str, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Назначить хоткей")
-        self.setModal(True)
-        self.resize(520, 190)
-
-        self.result_hotkey: Optional[str] = None
-        self._pressed: set[str] = set()
-
-        title = QtWidgets.QLabel("Нажмите комбинацию (Ctrl/Alt/Shift + клавиша). Esc — отмена.")
-        title.setWordWrap(True)
-        cur = QtWidgets.QLabel(f"Текущий: {current}")
-        cur.setObjectName("Muted")
-        self.live = QtWidgets.QLabel("Новая: —")
-        self.live.setObjectName("HotkeyLive")
-
-        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Cancel)
-        btns.rejected.connect(self.reject)
-
-        lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(16, 16, 16, 16)
-        lay.setSpacing(10)
-        lay.addWidget(title)
-        lay.addWidget(cur)
-        lay.addWidget(self.live)
-        lay.addStretch(1)
-        lay.addWidget(btns)
-
-        self.installEventFilter(self)
-
-    def _norm_key(self, e: QtGui.QKeyEvent) -> Optional[str]:
-        k = e.key()
-        if k == QtCore.Qt.Key_Escape:
-            return "ESC"
-        if k == QtCore.Qt.Key_Control:
-            return "<ctrl>"
-        if k == QtCore.Qt.Key_Alt:
-            return "<alt>"
-        if k == QtCore.Qt.Key_Shift:
-            return "<shift>"
-        if k in (QtCore.Qt.Key_Meta,):
-            return "<cmd>"
-
-        text = (e.text() or "").lower().strip()
-        if text:
-            if len(text) == 1:
-                return text
-            return text
-
-        if QtCore.Qt.Key_F1 <= k <= QtCore.Qt.Key_F35:
-            return f"f{k - QtCore.Qt.Key_F1 + 1}"
-        if k == QtCore.Qt.Key_Space:
-            return "space"
-        if k == QtCore.Qt.Key_Tab:
-            return "tab"
-        if k in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
-            return "enter"
-        return None
-
-    def _compose(self) -> Optional[str]:
-        mods = [m for m in ["<ctrl>", "<alt>", "<shift>", "<cmd>"] if m in self._pressed]
-        keys = [k for k in sorted(self._pressed) if k not in ("<ctrl>", "<alt>", "<shift>", "<cmd>")]
-        if not keys:
-            return None
-        return "+".join(mods + keys[:1])
-
-    def eventFilter(self, obj, event):
-        if event.type() == QtCore.QEvent.KeyPress:
-            k = self._norm_key(event)
-            if k == "ESC":
-                self.reject()
-                return True
-            if k:
-                self._pressed.add(k)
-                hk = self._compose()
-                if hk:
-                    self.live.setText(f"Новая: {hk}")
-                    if any(m in self._pressed for m in ("<ctrl>", "<alt>", "<shift>", "<cmd>")):
-                        self.result_hotkey = hk
-                        self.accept()
-                return True
-        if event.type() == QtCore.QEvent.KeyRelease:
-            k = self._norm_key(event)
-            if k and k in self._pressed:
-                self._pressed.remove(k)
-            return True
-        return super().eventFilter(obj, event)
+@dataclass
+class Shift:
+    id: str
+    start_ts: str
+    end_ts: Optional[str]
+    operations: List[Operation]
 
 
-# ------------------------------- Global Hotkeys -------------------------------
+def default_comments() -> Dict[str, List[str]]:
+    return {
+        "income": ["Заказ", "Чаевые", "Бонус", "Доставка"],
+        "expense": ["Бензин", "Штраф", "Ремонт", "Еда/Кофе"],
+    }
 
-class GlobalHotkeys(QtCore.QObject):
-    triggered = QtCore.Signal(str)
 
-    def __init__(self):
-        super().__init__()
-        self._listener: Optional[pynput_keyboard.GlobalHotKeys] = None
-        self._thread: Optional[threading.Thread] = None
+def default_data() -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "settings": {
+            "comments": default_comments(),
+            "overlay_always_on_top": True,
+            "overlay_opacity": 92,       # 30..100
+            "overlay_frameless": False,
+        },
+        "shifts": [],
+        "active_shift_id": None,
+    }
 
-    def start(self, action_to_hotkey: Dict[str, str]):
-        self.stop()
 
-        hotkey_to_action: Dict[str, str] = {}
-        for action, hk in action_to_hotkey.items():
-            hk = (hk or "").strip()
-            if hk:
-                hotkey_to_action[hk] = action
+class Storage:
+    def __init__(self) -> None:
+        base = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+        self.dir = Path(base) / APP_NAME
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.dir / DATA_FILE
+        self.data: Dict[str, Any] = {}
 
-        def make_cb(action_name: str):
-            def _cb():
-                self.triggered.emit(action_name)
-            return _cb
+    def load(self) -> Dict[str, Any]:
+        if not self.path.exists():
+            self.data = default_data()
+            self._ensure_other_comment()
+            self.save()
+            return self.data
 
         try:
-            callbacks = {hk: make_cb(action) for hk, action in hotkey_to_action.items()}
-            self._listener = pynput_keyboard.GlobalHotKeys(callbacks)
+            self.data = json.loads(self.path.read_text(encoding="utf-8"))
         except Exception:
-            self._listener = None
-            return
-
-        def run():
             try:
-                if self._listener:
-                    self._listener.start()
-                    self._listener.join()
+                self.path.replace(self.path.with_suffix(".broken.json"))
             except Exception:
                 pass
+            self.data = default_data()
+            self._ensure_other_comment()
+            self.save()
 
-        self._thread = threading.Thread(target=run, daemon=True)
-        self._thread.start()
+        # defaults
+        self.data.setdefault("settings", default_data()["settings"])
+        self.data["settings"].setdefault("comments", default_comments())
+        self.data["settings"]["comments"].setdefault("income", default_comments()["income"])
+        self.data["settings"]["comments"].setdefault("expense", default_comments()["expense"])
+        self.data.setdefault("shifts", [])
+        self.data.setdefault("active_shift_id", None)
 
-    def stop(self):
+        s = self.data["settings"]
+        s.setdefault("overlay_always_on_top", True)
+        s.setdefault("overlay_opacity", 92)
+        s.setdefault("overlay_frameless", False)
+
+        self._ensure_other_comment()
+        self.save()
+        return self.data
+
+    def _ensure_other_comment(self):
+        # В настройках "Другое" не храним как обычный комментарий, но гарантируем его наличие логически.
+        # Поэтому тут ничего не добавляем в списки, просто место для будущих миграций.
+        pass
+
+    def save(self) -> None:
         try:
-            if self._listener:
-                self._listener.stop()
+            self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
-        self._listener = None
-        self._thread = None
 
-
-# ------------------------------- Main Window (Dashboard UI) -------------------------------
-
-class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, db: DB):
-        super().__init__()
-        self.db = db
-
-        self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(1060, 680)
-
-        # overlay
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
-
-        # state
-        self.current_day_text: str = day_key(date.today())
-        self.active_shift_id: Optional[int] = None
-
-        # central layout: sidebar + content (stack)
-        central = QtWidgets.QWidget()
-        self.setCentralWidget(central)
-        root = QtWidgets.QHBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-
-        self.sidebar = self._build_sidebar()
-        self.stack = QtWidgets.QStackedWidget()
-
-        self.page_shift = self._build_page_shift()
-        self.page_analytics = self._build_page_analytics()
-        self.page_settings = self._build_page_settings()
-
-        self.stack.addWidget(self.page_shift)
-        self.stack.addWidget(self.page_analytics)
-        self.stack.addWidget(self.page_settings)
-
-        root.addWidget(self.sidebar, 0)
-        root.addWidget(self.stack, 1)
-
-        self.status = QtWidgets.QStatusBar()
-        self.setStatusBar(self.status)
-
-        self.hotkeys = GlobalHotkeys()
-        self.hotkeys.triggered.connect(self.on_hotkey_action)
-
-        self.timer = QtCore.QTimer(self)
-        self.timer.setInterval(1000)
-        self.timer.timeout.connect(self.refresh_shift_summary_only)
-        self.timer.start()
-
-        self.apply_styles()
-        self.reload_state_from_db()
-        self.restart_hotkeys_from_settings()
-
-        # compact mode from settings
-        self.apply_compact_mode(self.db.get_setting("ui_compact") == "1")
-
-    # ------------------------- UI: Sidebar / Topbar helpers -------------------------
-
-    def _build_sidebar(self) -> QtWidgets.QWidget:
-        w = QtWidgets.QFrame()
-        w.setObjectName("Sidebar")
-        w.setFixedWidth(230)
-
-        lay = QtWidgets.QVBoxLayout(w)
-        lay.setContentsMargins(16, 16, 16, 16)
-        lay.setSpacing(14)
-
-        brand = QtWidgets.QHBoxLayout()
-        logo = QtWidgets.QLabel("◆")
-        logo.setObjectName("BrandLogo")
-        name = QtWidgets.QLabel("TaxiCalc")
-        name.setObjectName("BrandName")
-        brand.addWidget(logo, 0)
-        brand.addWidget(name, 1)
-        brand.addStretch(1)
-        lay.addLayout(brand)
-
-        lay.addSpacing(4)
-
-        self.btn_nav_shift = QtWidgets.QPushButton("  Смена")
-        self.btn_nav_analytics = QtWidgets.QPushButton("  Аналитика")
-        self.btn_nav_settings = QtWidgets.QPushButton("  Настройки")
-
-        for b in (self.btn_nav_shift, self.btn_nav_analytics, self.btn_nav_settings):
-            b.setObjectName("NavBtn")
-            b.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-            b.setCheckable(True)
-            b.setAutoExclusive(True)
-
-        self.btn_nav_shift.setChecked(True)
-
-        self.btn_nav_shift.clicked.connect(lambda: self.stack.setCurrentIndex(0))
-        self.btn_nav_analytics.clicked.connect(lambda: self.stack.setCurrentIndex(1))
-        self.btn_nav_settings.clicked.connect(lambda: self.stack.setCurrentIndex(2))
-
-        lay.addWidget(self.btn_nav_shift)
-        lay.addWidget(self.btn_nav_analytics)
-        lay.addWidget(self.btn_nav_settings)
-
-        lay.addStretch(1)
-
-        # quick overlay actions
-        self.btn_toggle_visible = QtWidgets.QPushButton("Скрыть / Показать")
-        self.btn_toggle_visible.setObjectName("NavBtnAlt")
-        self.btn_toggle_visible.clicked.connect(self.toggle_visibility)
-
-        self.btn_screenshot = QtWidgets.QPushButton("Скрин в буфер")
-        self.btn_screenshot.setObjectName("NavBtnAlt")
-        self.btn_screenshot.clicked.connect(self.screenshot_to_clipboard)
-
-        lay.addWidget(self.btn_toggle_visible)
-        lay.addWidget(self.btn_screenshot)
-
-        hint = QtWidgets.QLabel("Hotkey: Ctrl+Alt+H\n(настраивается)")
-        hint.setObjectName("SidebarHint")
-        lay.addWidget(hint)
-
-        return w
-
-    def _topbar(self, title: str) -> QtWidgets.QWidget:
-        bar = QtWidgets.QFrame()
-        bar.setObjectName("Topbar")
-        lay = QtWidgets.QHBoxLayout(bar)
-        lay.setContentsMargins(18, 14, 18, 14)
-        lay.setSpacing(10)
-
-        t = QtWidgets.QLabel(title)
-        t.setObjectName("TopTitle")
-
-        self.search = QtWidgets.QLineEdit()
-        self.search.setPlaceholderText("Search (необязательно)")
-        self.search.setObjectName("Search")
-        self.search.setClearButtonEnabled(True)
-
-        self.lbl_day = QtWidgets.QLabel("—")
-        self.lbl_day.setObjectName("DayPill")
-
-        self.btn_new_day = PillButton("Новый день", primary=False)
-        self.btn_new_day.clicked.connect(self.on_new_day)
-
-        self.btn_top = PillButton("Always On Top", primary=False)
-        self.btn_top.clicked.connect(self.on_toggle_always_on_top)
-
-        self.btn_compact = PillButton("Компактный режим", primary=False)
-        self.btn_compact.clicked.connect(self.toggle_compact_mode)
-
-        lay.addWidget(t, 0)
-        lay.addStretch(1)
-        lay.addWidget(self.search, 2)
-        lay.addWidget(self.lbl_day, 0)
-        lay.addWidget(self.btn_new_day, 0)
-        lay.addWidget(self.btn_top, 0)
-        lay.addWidget(self.btn_compact, 0)
-        return bar
-
-    # ------------------------- Page: Shift -------------------------
-
-    def _build_page_shift(self) -> QtWidgets.QWidget:
-        page = QtWidgets.QWidget()
-        outer = QtWidgets.QVBoxLayout(page)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        outer.addWidget(self._topbar("Смена"))
-
-        content = QtWidgets.QWidget()
-        content.setObjectName("Content")
-        lay = QtWidgets.QVBoxLayout(content)
-        lay.setContentsMargins(18, 18, 18, 18)
-        lay.setSpacing(14)
-
-        # metric row
-        row = QtWidgets.QHBoxLayout()
-        row.setSpacing(12)
-        self.card_status = MetricCard("Смена")
-        self.card_inc = MetricCard("Доход")
-        self.card_exp = MetricCard("Расход")
-        self.card_profit = MetricCard("Прибыль")
-        self.card_time = MetricCard("Время")
-        for c in (self.card_status, self.card_inc, self.card_exp, self.card_profit, self.card_time):
-            row.addWidget(c)
-        lay.addLayout(row)
-
-        # actions + inputs grid
-        grid = QtWidgets.QGridLayout()
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(12)
-
-        left = Card()
-        llay = QtWidgets.QVBoxLayout(left)
-        llay.setContentsMargins(16, 16, 16, 16)
-        llay.setSpacing(10)
-
-        title = QtWidgets.QLabel("Управление сменой")
-        title.setObjectName("BlockTitle")
-        llay.addWidget(title)
-
-        btns = QtWidgets.QHBoxLayout()
-        self.btn_start_shift = PillButton("Начать смену", primary=True)
-        self.btn_end_shift = PillButton("Завершить смену", primary=False)
-        self.btn_start_shift.clicked.connect(self.on_start_shift)
-        self.btn_end_shift.clicked.connect(self.on_end_shift)
-        btns.addWidget(self.btn_start_shift)
-        btns.addWidget(self.btn_end_shift)
-        llay.addLayout(btns)
-
-        form = QtWidgets.QGridLayout()
-        form.setHorizontalSpacing(10)
-        form.setVerticalSpacing(10)
-
-        self.kind_combo = QtWidgets.QComboBox()
-        self.kind_combo.addItems(["Доход", "Расход"])
-        self.kind_combo.currentIndexChanged.connect(self.on_kind_changed)
-
-        self.amount_edit = QtWidgets.QLineEdit()
-        self.amount_edit.setPlaceholderText("Сумма (например 500)")
-        self.amount_edit.returnPressed.connect(self.on_add_operation)
-
-        self.comment_combo = QtWidgets.QComboBox()
-        self.other_comment = QtWidgets.QLineEdit()
-        self.other_comment.setPlaceholderText("Комментарий для 'Другое'")
-        self.other_comment.setEnabled(False)
-        self.comment_combo.currentIndexChanged.connect(self.on_comment_changed)
-
-        self.btn_add = PillButton("Добавить (Enter)", primary=True)
-        self.btn_add.clicked.connect(self.on_add_operation)
-
-        form.addWidget(QtWidgets.QLabel("Тип"), 0, 0)
-        form.addWidget(self.kind_combo, 0, 1)
-        form.addWidget(QtWidgets.QLabel("Сумма"), 1, 0)
-        form.addWidget(self.amount_edit, 1, 1)
-        form.addWidget(QtWidgets.QLabel("Комментарий"), 2, 0)
-        form.addWidget(self.comment_combo, 2, 1)
-        form.addWidget(self.other_comment, 3, 0, 1, 2)
-        form.addWidget(self.btn_add, 4, 0, 1, 2)
-
-        llay.addLayout(form)
-        llay.addStretch(1)
-
-        right = Card()
-        rlay = QtWidgets.QVBoxLayout(right)
-        rlay.setContentsMargins(16, 16, 16, 16)
-        rlay.setSpacing(10)
-        rtitle = QtWidgets.QLabel("Операции текущей смены")
-        rtitle.setObjectName("BlockTitle")
-        rlay.addWidget(rtitle)
-
-        self.ops_table = QtWidgets.QTableWidget(0, 4)
-        self.ops_table.setHorizontalHeaderLabels(["Время", "Тип", "Сумма", "Комментарий"])
-        self.ops_table.horizontalHeader().setStretchLastSection(True)
-        self.ops_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.ops_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.ops_table.verticalHeader().setVisible(False)
-
-        rlay.addWidget(self.ops_table)
-
-        grid.addWidget(left, 0, 0)
-        grid.addWidget(right, 0, 1)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 2)
-
-        lay.addLayout(grid)
-
-        outer.addWidget(content, 1)
-
-        self._load_comment_presets()
-        return page
-
-    def _load_comment_presets(self):
-        self.comment_combo.blockSignals(True)
-        self.comment_combo.clear()
-        if self.kind_combo.currentText() == "Доход":
-            self.comment_combo.addItems(["Чай", "Согласно тарифу", "Другое"])
+    def shifts(self) -> List[Shift]:
+        out: List[Shift] = []
+        for sd in self.data.get("shifts", []):
+            ops = [Operation(**od) for od in sd.get("operations", [])]
+            out.append(Shift(id=sd["id"], start_ts=sd["start_ts"], end_ts=sd.get("end_ts"), operations=ops))
+        return out
+
+    def _save_shifts(self, shifts: List[Shift]) -> None:
+        self.data["shifts"] = [
+            {"id": s.id, "start_ts": s.start_ts, "end_ts": s.end_ts, "operations": [asdict(op) for op in s.operations]}
+            for s in shifts
+        ]
+        self.save()
+
+    def get_active_shift(self) -> Shift:
+        sid = self.data.get("active_shift_id")
+        shifts = self.shifts()
+
+        if sid:
+            for s in shifts:
+                if s.id == sid:
+                    return s
+
+        new_shift = Shift(id=str(uuid.uuid4()), start_ts=now_iso(), end_ts=None, operations=[])
+        shifts.append(new_shift)
+        self._save_shifts(shifts)
+        self.data["active_shift_id"] = new_shift.id
+        self.save()
+        return new_shift
+
+    def update_shift(self, updated: Shift) -> None:
+        shifts = self.shifts()
+        for i, s in enumerate(shifts):
+            if s.id == updated.id:
+                shifts[i] = updated
+                break
         else:
-            self.comment_combo.addItems(["Аренда авто", "Ремонт", "Заправка", "Штраф", "Другое"])
-        self.comment_combo.blockSignals(False)
-        self.on_comment_changed()
+            shifts.append(updated)
+        self._save_shifts(shifts)
 
-    def on_kind_changed(self):
-        self._load_comment_presets()
+    def end_shift_and_create_new(self) -> Shift:
+        current = self.get_active_shift()
+        if current.end_ts is None:
+            current.end_ts = now_iso()
+            self.update_shift(current)
 
-    def on_comment_changed(self):
-        is_other = (self.comment_combo.currentText() == "Другое")
-        self.other_comment.setEnabled(is_other)
-        if not is_other:
-            self.other_comment.setText("")
+        new_shift = Shift(id=str(uuid.uuid4()), start_ts=now_iso(), end_ts=None, operations=[])
+        shifts = self.shifts()
+        shifts.append(new_shift)
+        self._save_shifts(shifts)
+        self.data["active_shift_id"] = new_shift.id
+        self.save()
+        return new_shift
 
-    # ------------------------- Page: Analytics -------------------------
+    def reset_current_shift_operations(self) -> Shift:
+        current = self.get_active_shift()
+        current.operations = []
+        self.update_shift(current)
+        return current
 
-    def _build_page_analytics(self) -> QtWidgets.QWidget:
-        page = QtWidgets.QWidget()
-        outer = QtWidgets.QVBoxLayout(page)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+    def add_operation_to_active(self, amount: int, comment: str) -> Operation:
+        current = self.get_active_shift()
+        op = Operation(id=str(uuid.uuid4()), ts=now_iso(), amount=amount, comment=comment)
+        current.operations.append(op)
+        self.update_shift(current)
+        return op
 
-        outer.addWidget(self._topbar("Аналитика"))
+    def delete_operation_from_shift(self, shift_id: str, op_id: str) -> None:
+        shifts = self.shifts()
+        for s in shifts:
+            if s.id == shift_id:
+                s.operations = [op for op in s.operations if op.id != op_id]
+                self.update_shift(s)
+                return
 
-        content = QtWidgets.QWidget()
-        content.setObjectName("Content")
-        lay = QtWidgets.QVBoxLayout(content)
-        lay.setContentsMargins(18, 18, 18, 18)
-        lay.setSpacing(14)
+    def delete_operation_from_active(self, op_id: str) -> None:
+        current = self.get_active_shift()
+        current.operations = [op for op in current.operations if op.id != op_id]
+        self.update_shift(current)
 
-        # filters card
-        flt = Card()
-        fl = QtWidgets.QGridLayout(flt)
-        fl.setContentsMargins(16, 16, 16, 16)
-        fl.setHorizontalSpacing(10)
-        fl.setVerticalSpacing(10)
+    def find_operation(self, op_id: str) -> Optional[Tuple[Shift, Operation]]:
+        for s in self.shifts():
+            for op in s.operations:
+                if op.id == op_id:
+                    return s, op
+        return None
 
-        self.date_from = QtWidgets.QDateEdit()
-        self.date_to = QtWidgets.QDateEdit()
-        self.date_from.setCalendarPopup(True)
-        self.date_to.setCalendarPopup(True)
-        self.date_from.setDate(QtCore.QDate.currentDate().addDays(-6))
-        self.date_to.setDate(QtCore.QDate.currentDate())
+    def get_comments(self) -> Dict[str, List[str]]:
+        return self.data["settings"]["comments"]
 
-        self.day_pick = QtWidgets.QComboBox()
-        self.shift_pick = QtWidgets.QComboBox()
-        self.btn_refresh_analytics = PillButton("Обновить", primary=True)
-        self.btn_refresh_analytics.clicked.connect(self.refresh_analytics)
+    def set_comments(self, income: List[str], expense: List[str]) -> None:
+        self.data["settings"]["comments"]["income"] = income
+        self.data["settings"]["comments"]["expense"] = expense
+        self.save()
 
-        fl.addWidget(QtWidgets.QLabel("Период:"), 0, 0)
-        fl.addWidget(self.date_from, 0, 1)
-        fl.addWidget(QtWidgets.QLabel("—"), 0, 2)
-        fl.addWidget(self.date_to, 0, 3)
-        fl.addWidget(QtWidgets.QLabel("День:"), 1, 0)
-        fl.addWidget(self.day_pick, 1, 1, 1, 2)
-        fl.addWidget(QtWidgets.QLabel("Смена:"), 1, 3)
-        fl.addWidget(self.shift_pick, 1, 4)
-        fl.addWidget(self.btn_refresh_analytics, 0, 4)
+    def get_overlay_settings(self) -> Dict[str, Any]:
+        return {
+            "always_on_top": bool(self.data["settings"].get("overlay_always_on_top", True)),
+            "opacity": int(self.data["settings"].get("overlay_opacity", 92)),
+            "frameless": bool(self.data["settings"].get("overlay_frameless", False)),
+        }
 
-        lay.addWidget(flt)
+    def set_overlay_settings(self, always_on_top: bool, opacity: int, frameless: bool) -> None:
+        self.data["settings"]["overlay_always_on_top"] = bool(always_on_top)
+        self.data["settings"]["overlay_opacity"] = int(opacity)
+        self.data["settings"]["overlay_frameless"] = bool(frameless)
+        self.save()
 
-        # metrics grid
-        mrow = QtWidgets.QHBoxLayout()
-        mrow.setSpacing(12)
-        self.a_inc = MetricCard("Доход")
-        self.a_exp = MetricCard("Расход")
-        self.a_profit = MetricCard("Прибыль")
-        self.a_shifts = MetricCard("Смен")
-        self.a_time = MetricCard("Время")
-        self.a_inc_h = MetricCard("Доход/час")
-        self.a_profit_h = MetricCard("Прибыль/час")
-        self.a_avg = MetricCard("Средн. прибыль/смена")
-        for c in (self.a_inc, self.a_exp, self.a_profit, self.a_shifts, self.a_time, self.a_inc_h, self.a_profit_h, self.a_avg):
-            mrow.addWidget(c)
-        lay.addLayout(mrow)
+    def totals_all_time(self) -> Tuple[int, int, int]:
+        inc = 0
+        exp = 0
+        for s in self.shifts():
+            for op in s.operations:
+                if op.amount >= 0:
+                    inc += op.amount
+                else:
+                    exp += (-op.amount)
+        return inc, exp, inc - exp
 
-        # charts row
-        crow = QtWidgets.QHBoxLayout()
-        crow.setSpacing(12)
+    def reset_all_history(self) -> None:
+        self.data["shifts"] = []
+        self.data["active_shift_id"] = None
+        self.save()
 
-        c1 = Card()
-        c1l = QtWidgets.QVBoxLayout(c1)
-        c1l.setContentsMargins(16, 16, 16, 16)
-        c1l.setSpacing(10)
-        t1 = QtWidgets.QLabel("Доход / Расход / Прибыль по дням")
-        t1.setObjectName("BlockTitle")
-        self.chart_main = MplChart()
-        c1l.addWidget(t1)
-        c1l.addWidget(self.chart_main)
 
-        c2 = Card()
-        c2l = QtWidgets.QVBoxLayout(c2)
-        c2l.setContentsMargins(16, 16, 16, 16)
-        c2l.setSpacing(10)
-        t2 = QtWidgets.QLabel("Структура расходов")
-        t2.setObjectName("BlockTitle")
-        self.chart_pie = MplChart()
-        c2l.addWidget(t2)
-        c2l.addWidget(self.chart_pie)
+# ---------------------------
+# Styling
+# ---------------------------
 
-        crow.addWidget(c1, 2)
-        crow.addWidget(c2, 1)
+def modern_stylesheet() -> str:
+    return """
+    * { font-family: "Segoe UI"; color: #EAF0FF; }
+    QMainWindow, QWidget { background: #060812; }
 
-        lay.addLayout(crow, 1)
+    /* Cards */
+    QFrame#Card {
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+            stop:0 #101A2E, stop:1 #090E1F);
+        border: 1px solid rgba(233,240,255,0.10);
+        border-radius: 18px;
+    }
+    QFrame#SoftCard {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(233,240,255,0.08);
+        border-radius: 18px;
+    }
 
-        # tables row
-        brow = QtWidgets.QHBoxLayout()
-        brow.setSpacing(12)
+    /* Typography */
+    QLabel#Title { font-size: 18px; font-weight: 900; color: #F6F9FF; }
+    QLabel#Section { font-size: 14px; font-weight: 900; color: #F6F9FF; letter-spacing: 0.2px; }
+    QLabel#Muted { color: rgba(233,240,255,0.62); }
+    QLabel#Kpi { font-size: 32px; font-weight: 950; letter-spacing: 0.4px; }
+    QLabel#KpiSmall { font-size: 14px; font-weight: 900; letter-spacing: 0.2px; }
+    QLabel#Chip {
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(233,240,255,0.10);
+        border-radius: 999px;
+        padding: 6px 10px;
+        font-weight: 900;
+        color: rgba(233,240,255,0.80);
+    }
 
-        sh_card = Card()
-        shl = QtWidgets.QVBoxLayout(sh_card)
-        shl.setContentsMargins(16, 16, 16, 16)
-        shl.setSpacing(10)
-        shl.addWidget(self._block_title("Смены"))
+    /* Inputs */
+    QLineEdit, QComboBox, QSpinBox, QTextEdit {
+        background: rgba(0,0,0,0.30);
+        border: 1px solid rgba(233,240,255,0.12);
+        border-radius: 14px;
+        padding: 11px 12px;
+        selection-background-color: rgba(59,130,246,0.90);
+    }
+    QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTextEdit:focus {
+        border: 1px solid rgba(99,102,241,0.95);
+    }
+    QComboBox::drop-down { border: 0px; width: 26px; }
+    QComboBox QAbstractItemView {
+        background: #090E1F;
+        border: 1px solid rgba(233,240,255,0.12);
+        selection-background-color: rgba(59,130,246,0.75);
+        outline: 0;
+    }
 
-        self.table_shifts = QtWidgets.QTableWidget(0, 8)
-        self.table_shifts.setHorizontalHeaderLabels(["День", "ID", "Старт", "Финиш", "Доход", "Расход", "Прибыль", "Длит."])
-        self.table_shifts.horizontalHeader().setStretchLastSection(True)
-        self.table_shifts.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.table_shifts.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.table_shifts.verticalHeader().setVisible(False)
-        self.table_shifts.itemSelectionChanged.connect(self.on_shift_table_selected)
-        shl.addWidget(self.table_shifts)
+    /* Base buttons (we paint custom on shimmer buttons) */
+    QPushButton {
+        border-radius: 14px;
+        padding: 11px 14px;
+        font-weight: 900;
+    }
 
-        ops_card = Card()
-        opl = QtWidgets.QVBoxLayout(ops_card)
-        opl.setContentsMargins(16, 16, 16, 16)
-        opl.setSpacing(10)
-        opl.addWidget(self._block_title("Операции выбранной смены"))
+    /* List */
+    QListWidget { background: transparent; border: 0px; }
+    QListWidget::item { background: transparent; border: 0px; padding: 0px; margin: 0px; }
+    QListWidget::item:selected { background: transparent; }
 
-        self.table_ops = QtWidgets.QTableWidget(0, 4)
-        self.table_ops.setHorizontalHeaderLabels(["Время", "Тип", "Сумма", "Комментарий"])
-        self.table_ops.horizontalHeader().setStretchLastSection(True)
-        self.table_ops.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.table_ops.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.table_ops.verticalHeader().setVisible(False)
-        opl.addWidget(self.table_ops)
+    /* Tabs + Tables */
+    QTabWidget::pane { border: 1px solid rgba(233,240,255,0.10); border-radius: 18px; background: rgba(0,0,0,0.20); }
+    QTabBar::tab {
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(233,240,255,0.10);
+        padding: 10px 14px;
+        border-top-left-radius: 14px;
+        border-top-right-radius: 14px;
+        margin-right: 8px;
+        font-weight: 950;
+        color: rgba(233,240,255,0.86);
+    }
+    QTabBar::tab:selected {
+        background: rgba(99,102,241,0.16);
+        border: 1px solid rgba(99,102,241,0.70);
+        color: #F6F9FF;
+    }
+    QHeaderView::section {
+        background: rgba(99,102,241,0.12);
+        border: 1px solid rgba(233,240,255,0.10);
+        padding: 8px 10px;
+        font-weight: 950;
+        color: rgba(233,240,255,0.92);
+    }
+    QTableWidget {
+        background: rgba(0,0,0,0.18);
+        border: 1px solid rgba(233,240,255,0.10);
+        border-radius: 16px;
+        gridline-color: rgba(233,240,255,0.06);
+    }
+    QTableWidget::item { padding: 8px 10px; }
 
-        brow.addWidget(sh_card, 2)
-        brow.addWidget(ops_card, 1)
+    QSplitter::handle { background: rgba(233,240,255,0.05); }
 
-        lay.addLayout(brow, 2)
+    /* Checkbox */
+    QCheckBox { spacing: 10px; font-weight: 900; }
+    QCheckBox::indicator {
+        width: 18px; height: 18px;
+        border-radius: 6px;
+        border: 1px solid rgba(233,240,255,0.12);
+        background: rgba(0,0,0,0.30);
+    }
+    QCheckBox::indicator:checked {
+        background: rgba(99,102,241,0.90);
+        border: 1px solid rgba(99,102,241,0.90);
+    }
+    """
 
-        outer.addWidget(content, 1)
-        return page
 
-    def _block_title(self, text: str) -> QtWidgets.QLabel:
-        t = QtWidgets.QLabel(text)
-        t.setObjectName("BlockTitle")
-        return t
+# ---------------------------
+# Widgets
+# ---------------------------
 
-    # ------------------------- Page: Settings -------------------------
+class Card(QFrame):
+    def __init__(self, soft: bool = False):
+        super().__init__()
+        self.setObjectName("SoftCard" if soft else "Card")
 
-    def _build_page_settings(self) -> QtWidgets.QWidget:
-        page = QtWidgets.QWidget()
-        outer = QtWidgets.QVBoxLayout(page)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
 
-        outer.addWidget(self._topbar("Настройки"))
+class ShimmerButton(QPushButton):
+    """
+    “Перелив” запускается только при наведении.
+    В обычном состоянии — статичный аккуратный градиент.
+    """
+    def __init__(self, text: str, kind: str = "primary"):
+        super().__init__(text)
+        self.kind = kind  # primary / danger / neutral
+        self._phase = 0.0
+        self._hover = False
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
 
-        content = QtWidgets.QWidget()
-        content.setObjectName("Content")
-        lay = QtWidgets.QVBoxLayout(content)
-        lay.setContentsMargins(18, 18, 18, 18)
-        lay.setSpacing(14)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(42)
 
-        hk = Card()
-        hkl = QtWidgets.QGridLayout(hk)
-        hkl.setContentsMargins(16, 16, 16, 16)
-        hkl.setHorizontalSpacing(10)
-        hkl.setVerticalSpacing(12)
+    def enterEvent(self, event):
+        self._hover = True
+        self._timer.start()
+        self.update()
+        return super().enterEvent(event)
 
-        title = self._block_title("Горячие клавиши (глобальные)")
-        hkl.addWidget(title, 0, 0, 1, 3)
+    def leaveEvent(self, event):
+        self._hover = False
+        self._timer.stop()
+        self.update()
+        return super().leaveEvent(event)
 
-        self.hk_toggle_lbl = QtWidgets.QLabel("—")
-        self.hk_income_lbl = QtWidgets.QLabel("—")
-        self.hk_expense_lbl = QtWidgets.QLabel("—")
-        self.hk_shot_lbl = QtWidgets.QLabel("—")
-        for lbl in (self.hk_toggle_lbl, self.hk_income_lbl, self.hk_expense_lbl, self.hk_shot_lbl):
-            lbl.setObjectName("MonoPill")
+    def _tick(self):
+        self._phase += 0.020
+        if self._phase > 1.0:
+            self._phase -= 1.0
+        self.update()
 
-        def mk_btn(key: str) -> QtWidgets.QPushButton:
-            b = PillButton("Изменить", primary=False)
-            b.clicked.connect(lambda: self.change_hotkey(key))
-            return b
+    def _palette(self):
+        if self.kind == "danger":
+            c1 = QColor("#B42318")
+            c2 = QColor("#FF5B77")
+            border = QColor(255, 100, 125, 170)
+            glow = QColor(255, 91, 119, 55)
+        elif self.kind == "neutral":
+            c1 = QColor(90, 110, 160, 85)
+            c2 = QColor(140, 165, 220, 55)
+            border = QColor(233, 240, 255, 70)
+            glow = QColor(233, 240, 255, 22)
+        else:
+            c1 = QColor("#4F46E5")  # indigo
+            c2 = QColor("#60A5FA")  # blue
+            border = QColor(120, 140, 255, 180)
+            glow = QColor(99, 102, 241, 55)
 
-        hkl.addWidget(QtWidgets.QLabel("Показать / скрыть"), 1, 0)
-        hkl.addWidget(self.hk_toggle_lbl, 1, 1)
-        hkl.addWidget(mk_btn("hotkey_toggle"), 1, 2)
+        if not self.isEnabled():
+            c1 = QColor(255, 255, 255, 26)
+            c2 = QColor(255, 255, 255, 18)
+            border = QColor(255, 255, 255, 40)
+            glow = QColor(255, 255, 255, 0)
 
-        hkl.addWidget(QtWidgets.QLabel("Быстро добавить доход"), 2, 0)
-        hkl.addWidget(self.hk_income_lbl, 2, 1)
-        hkl.addWidget(mk_btn("hotkey_quick_income"), 2, 2)
+        return c1, c2, border, glow
 
-        hkl.addWidget(QtWidgets.QLabel("Быстро добавить расход"), 3, 0)
-        hkl.addWidget(self.hk_expense_lbl, 3, 1)
-        hkl.addWidget(mk_btn("hotkey_quick_expense"), 3, 2)
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
 
-        hkl.addWidget(QtWidgets.QLabel("Скрин окна в буфер"), 4, 0)
-        hkl.addWidget(self.hk_shot_lbl, 4, 1)
-        hkl.addWidget(mk_btn("hotkey_screenshot"), 4, 2)
+        r = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+        radius = 14.0
 
-        lay.addWidget(hk)
+        c1, c2, border, glow = self._palette()
 
-        misc = Card()
-        ml = QtWidgets.QVBoxLayout(misc)
-        ml.setContentsMargins(16, 16, 16, 16)
-        ml.setSpacing(10)
-        ml.addWidget(self._block_title("Оверлей / удобство"))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(glow)
+        painter.drawRoundedRect(r.adjusted(-1.0, -1.0, 1.0, 1.0), radius, radius)
 
-        info = QtWidgets.QLabel(
-            "• Окно поверх GTA 5 (Always On Top)\n"
-            "• Хоткеи работают глобально\n"
-            "• Компактный режим — удобнее во время активной игры\n"
+        g = QLinearGradient(r.left(), r.top(), r.right(), r.bottom())
+
+        if self._hover and self.isEnabled():
+            p = self._phase
+            g.setColorAt(0.0, c1)
+            g.setColorAt(max(0.0, p - 0.22), c1)
+            g.setColorAt(p, QColor(min(255, c2.red() + 30), min(255, c2.green() + 30), min(255, c2.blue() + 30)))
+            g.setColorAt(min(1.0, p + 0.22), c2)
+            g.setColorAt(1.0, c2)
+        else:
+            # статичный градиент
+            g.setColorAt(0.0, c1)
+            g.setColorAt(1.0, c2)
+
+        painter.setBrush(g)
+        painter.drawRoundedRect(r, radius, radius)
+
+        pen = QPen(border)
+        pen.setWidthF(1.15)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(r, radius, radius)
+
+        painter.setPen(QColor("#F6F9FF") if self.isEnabled() else QColor(233, 240, 255, 120))
+        painter.setFont(self.font())
+        painter.drawText(self.rect(), Qt.AlignCenter, self.text())
+
+
+class OperationCard(QWidget):
+    """
+    Более профессиональная карточка операции:
+    - слева: тип (IN/OUT), дата/время, комментарий
+    - справа: сумма
+    """
+    def __init__(self, dt_str: str, comment: str, amount: int):
+        super().__init__()
+        self.setAttribute(Qt.WA_StyledBackground, True)
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(14, 12, 14, 12)
+        outer.setSpacing(12)
+
+        # Type chip
+        typ = QLabel("IN" if amount >= 0 else "OUT")
+        typ.setAlignment(Qt.AlignCenter)
+        typ.setStyleSheet(
+            f"""
+            QLabel {{
+                background: {amount_soft_bg(amount)};
+                border: 1px solid {amount_color(amount)};
+                color: {amount_color(amount)};
+                border-radius: 10px;
+                min-width: 44px;
+                max-width: 44px;
+                padding: 7px 0px;
+                font-weight: 950;
+                letter-spacing: 0.6px;
+            }}
+            """
         )
-        info.setObjectName("Muted")
-        ml.addWidget(info)
+        outer.addWidget(typ)
 
-        row = QtWidgets.QHBoxLayout()
-        row.addStretch(1)
-        self.btn_restart_hotkeys = PillButton("Перезапустить хоткеи", primary=False)
-        self.btn_restart_hotkeys.clicked.connect(self.restart_hotkeys_from_settings)
-        row.addWidget(self.btn_restart_hotkeys)
-        ml.addLayout(row)
+        mid = QVBoxLayout()
+        mid.setSpacing(4)
 
-        lay.addWidget(misc)
-        lay.addStretch(1)
+        line1 = QLabel(dt_str)
+        line1.setObjectName("Muted")
+        line1.setStyleSheet("font-weight: 950; letter-spacing: 0.15px;")
+        mid.addWidget(line1)
 
-        outer.addWidget(content, 1)
-        return page
+        line2 = QLabel(comment)
+        line2.setWordWrap(True)
+        line2.setStyleSheet("font-weight: 950; font-size: 13px; color: rgba(246,249,255,0.95);")
+        mid.addWidget(line2)
 
-    # ------------------------- Styling -------------------------
+        outer.addLayout(mid, 1)
 
-    def apply_styles(self):
-        # Dashboard feel: dark sidebar, light content, white cards with soft border + radius
+        sign = "+" if amount >= 0 else ""
+        amt = QLabel(f"{sign}{format_money(amount)}")
+        amt.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        amt.setStyleSheet(f"font-weight: 950; font-size: 15px; color: {amount_color(amount)};")
+        outer.addWidget(amt)
+
         self.setStyleSheet("""
-        QMainWindow { background: #0B1020; }
-        QWidget { font-family: "Segoe UI", Arial; font-size: 10.5pt; }
-
-        /* Sidebar */
-        QFrame#Sidebar {
-            background: #0F1530;
-            border-right: 1px solid rgba(255,255,255,0.06);
-        }
-        QLabel#BrandLogo { color: #6D5EF6; font-size: 18pt; font-weight: 900; }
-        QLabel#BrandName { color: #EAF0FF; font-size: 12pt; font-weight: 800; }
-        QPushButton#NavBtn {
-            text-align: left;
-            padding: 10px 12px;
-            border-radius: 12px;
-            color: rgba(234,240,255,0.78);
-            background: transparent;
-            border: 1px solid transparent;
-        }
-        QPushButton#NavBtn:hover { background: rgba(255,255,255,0.06); }
-        QPushButton#NavBtn:checked {
-            background: rgba(109,94,246,0.18);
-            border: 1px solid rgba(109,94,246,0.28);
-            color: #EAF0FF;
-        }
-        QPushButton#NavBtnAlt {
-            text-align: left;
-            padding: 10px 12px;
-            border-radius: 12px;
-            background: rgba(255,255,255,0.06);
-            border: 1px solid rgba(255,255,255,0.08);
-            color: rgba(234,240,255,0.85);
-        }
-        QPushButton#NavBtnAlt:hover { background: rgba(255,255,255,0.09); }
-        QLabel#SidebarHint { color: rgba(234,240,255,0.55); font-size: 9pt; }
-
-        /* Content */
-        QWidget#Content { background: #F4F6FB; }
-        QFrame#Topbar {
-            background: #F4F6FB;
-            border-bottom: 1px solid rgba(10,15,30,0.08);
-        }
-        QLabel#TopTitle { color: #0B1020; font-size: 14pt; font-weight: 900; }
-        QLineEdit#Search {
-            background: #FFFFFF;
-            border: 1px solid rgba(10,15,30,0.12);
-            border-radius: 12px;
-            padding: 8px 12px;
-            color: #0B1020;
-        }
-        QLabel#DayPill {
-            background: rgba(109,94,246,0.10);
-            border: 1px solid rgba(109,94,246,0.22);
-            border-radius: 12px;
-            padding: 7px 10px;
-            color: #2A2F45;
-            font-weight: 700;
-        }
-
-        /* Buttons */
-        QPushButton#BtnPrimary {
-            background: #6D5EF6;
-            color: #FFFFFF;
-            border: 0;
-            padding: 9px 12px;
-            border-radius: 12px;
-            font-weight: 800;
-        }
-        QPushButton#BtnPrimary:hover { background: #5D50E7; }
-        QPushButton#BtnPrimary:pressed { background: #4D41D6; }
-
-        QPushButton#BtnGhost {
-            background: #FFFFFF;
-            color: #2A2F45;
-            border: 1px solid rgba(10,15,30,0.12);
-            padding: 9px 12px;
-            border-radius: 12px;
-            font-weight: 700;
-        }
-        QPushButton#BtnGhost:hover { background: rgba(255,255,255,0.85); }
-
-        /* Cards */
-        QFrame#Card {
-            background: #FFFFFF;
-            border: 1px solid rgba(10,15,30,0.10);
-            border-radius: 16px;
-        }
-        QLabel#CardTitle { color: rgba(42,47,69,0.72); font-size: 9.5pt; font-weight: 700; }
-        QLabel#CardValue { color: #0B1020; font-size: 20pt; font-weight: 900; }
-        QLabel#CardSub { color: rgba(42,47,69,0.55); font-size: 9pt; }
-
-        QLabel#BlockTitle { color: #0B1020; font-size: 11.5pt; font-weight: 900; }
-        QLabel#Muted { color: rgba(42,47,69,0.65); }
-        QLabel#HotkeyLive { font-size: 12pt; font-weight: 900; color: #0B1020; }
-        QLabel#MonoPill {
-            background: rgba(10,15,30,0.05);
-            border: 1px solid rgba(10,15,30,0.10);
-            border-radius: 12px;
-            padding: 7px 10px;
-            color: #0B1020;
-            font-family: "Consolas";
-        }
-
-        /* Inputs / tables */
-        QLineEdit, QComboBox, QDateEdit {
-            background: #FFFFFF;
-            border: 1px solid rgba(10,15,30,0.12);
-            border-radius: 12px;
-            padding: 8px 10px;
-            color: #0B1020;
-        }
-        QComboBox::drop-down { border: 0; }
-        QTableWidget {
-            background: #FFFFFF;
-            border: 1px solid rgba(10,15,30,0.10);
-            border-radius: 14px;
-            gridline-color: rgba(10,15,30,0.08);
-            color: #0B1020;
-        }
-        QHeaderView::section {
-            background: rgba(10,15,30,0.03);
-            border: 0;
-            padding: 8px;
-            color: rgba(42,47,69,0.75);
-            font-weight: 800;
-        }
+            OperationCard {
+                background: rgba(255,255,255,0.03);
+                border: 1px solid rgba(233,240,255,0.10);
+                border-radius: 16px;
+            }
         """)
 
-    # ------------------------- Overlay actions -------------------------
 
-    def on_toggle_always_on_top(self):
-        is_on = bool(self.windowFlags() & QtCore.Qt.WindowStaysOnTopHint)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, not is_on)
-        self.show()
-        self.toast("Always On Top: " + ("ВКЛ" if not is_on else "ВЫКЛ"))
+# ---------------------------
+# Dialogs
+# ---------------------------
 
-    def toggle_visibility(self):
-        if self.isVisible():
-            self.hide()
-        else:
-            self.show()
-            self.raise_()
-            self.activateWindow()
+class OperationDetailsDialog(QDialog):
+    def __init__(self, parent: QWidget, storage: "Storage", shift: Shift, op: Operation):
+        super().__init__(parent)
+        self.storage = storage
+        self.shift = shift
+        self.op = op
 
-    def screenshot_to_clipboard(self):
-        pix = self.grab()
-        QtWidgets.QApplication.clipboard().setPixmap(pix)
-        self.toast("Скриншот окна → буфер")
+        self.setWindowTitle("Операция — детали")
+        self.setModal(True)
+        self.resize(520, 360)
 
-    # compact mode (overlay-friendly)
-    def toggle_compact_mode(self):
-        is_compact = (self.db.get_setting("ui_compact") == "1")
-        self.apply_compact_mode(not is_compact)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
 
-    def apply_compact_mode(self, compact: bool):
-        self.db.set_setting("ui_compact", "1" if compact else "0")
-        if compact:
-            self.sidebar.setFixedWidth(190)
-            self.resize(860, 560)
-        else:
-            self.sidebar.setFixedWidth(230)
-            self.resize(1060, 680)
-        self.toast("Компактный режим: " + ("ВКЛ" if compact else "ВЫКЛ"))
+        title = QLabel("Операция")
+        title.setObjectName("Title")
+        root.addWidget(title)
 
-    # ------------------------- Hotkeys -------------------------
+        dt = iso_to_dt(op.ts)
 
-    def restart_hotkeys_from_settings(self):
-        mapping = {
-            "toggle": self.db.get_setting("hotkey_toggle") or "",
-            "quick_income": self.db.get_setting("hotkey_quick_income") or "",
-            "quick_expense": self.db.get_setting("hotkey_quick_expense") or "",
-            "screenshot": self.db.get_setting("hotkey_screenshot") or "",
-        }
-        self.hotkeys.start(mapping)
-        self.reload_hotkeys_labels()
+        form = QFormLayout()
+        form.addRow("Дата и время:", QLabel(dt_to_pretty(dt)))
 
-    def on_hotkey_action(self, action: str):
-        try:
-            if action == "toggle":
-                self.toggle_visibility()
-            elif action == "quick_income":
-                self.open_quick_add(kind="IN")
-            elif action == "quick_expense":
-                self.open_quick_add(kind="OUT")
-            elif action == "screenshot":
-                self.screenshot_to_clipboard()
-        except Exception:
-            traceback.print_exc()
+        a = QLabel(f"{'+' if op.amount>=0 else ''}{format_money(op.amount)}")
+        a.setObjectName("KpiSmall")
+        a.setStyleSheet(f"color: {amount_color(op.amount)};")
+        form.addRow("Сумма:", a)
 
-    # ------------------------- Business logic: Shift -------------------------
+        form.addRow("Комментарий:", QLabel(op.comment))
+        form.addRow("Смена (начало):", QLabel(dt_to_pretty(iso_to_dt(shift.start_ts))))
+        root.addLayout(form)
 
-    def on_new_day(self):
-        self.current_day_text = day_key(date.today())
-        self.db.ensure_day(date.today())
-        self.reload_state_from_db()
-        self.toast("Новый день: " + self.current_day_text)
+        btns = QHBoxLayout()
+        btns.addStretch(1)
 
-    def on_start_shift(self):
-        day_id = self.db.get_day_id_by_text(self.current_day_text)
-        if day_id is None:
-            day_id = self.db.ensure_day(parse_day_key(self.current_day_text))
-        self.active_shift_id = self.db.start_shift(day_id)
-        self.reload_state_from_db()
-        self.toast("Смена начата")
+        btn_del = ShimmerButton("Удалить", kind="danger")
+        btn_close = ShimmerButton("Закрыть", kind="neutral")
+        btns.addWidget(btn_del)
+        btns.addWidget(btn_close)
 
-    def on_end_shift(self):
-        active = self.db.get_active_shift()
-        if not active:
-            self.toast("Активной смены нет", error=True)
-            return
-        sid = int(active["id"])
-        self.db.end_shift(sid)
-
-        inc, exp = self.db.sums_for_shift(sid)
-        profit = inc - exp
-        st = datetime.fromisoformat(str(active["started_at"]))
-        en = now_local()
-        dur = int((en - st).total_seconds())
-
-        QtWidgets.QMessageBox.information(
-            self,
-            "Итог смены",
-            "Смена завершена.\n\n"
-            f"Доход: {fmt_money(inc)}\n"
-            f"Расход: {fmt_money(exp)}\n"
-            f"Чистая прибыль: {fmt_money(profit)}\n"
-            f"Длительность: {fmt_duration(dur)}\n"
-        )
-        self.reload_state_from_db()
-        self.refresh_analytics()
-
-    def on_add_operation(self):
-        active = self.db.get_active_shift()
-        if not active:
-            self.toast("Сначала начните смену", error=True)
-            return
-
-        amount = safe_float(self.amount_edit.text())
-        if amount is None or amount <= 0:
-            self.toast("Введите корректную сумму", error=True)
-            return
-
-        kind = "IN" if self.kind_combo.currentText() == "Доход" else "OUT"
-
-        comment = self.comment_combo.currentText()
-        if comment == "Другое":
-            comment = self.other_comment.text().strip()
-            if not comment:
-                self.toast("Введите комментарий для 'Другое'", error=True)
+        def do_delete():
+            ans = QMessageBox.question(
+                self, "Удаление", "Удалить эту операцию?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if ans != QMessageBox.Yes:
                 return
+            self.storage.delete_operation_from_shift(self.shift.id, self.op.id)
+            self.accept()
 
-        sid = int(active["id"])
-        self.db.add_op(sid, kind, float(amount), comment)
+        btn_del.clicked.connect(do_delete)
+        btn_close.clicked.connect(self.reject)
 
-        self.amount_edit.setText("")
-        self.amount_edit.setFocus(QtCore.Qt.TabFocusReason)
-        self.reload_state_from_db()
+        root.addLayout(btns)
 
-    def open_quick_add(self, kind: str):
-        active = self.db.get_active_shift()
-        if not active:
-            self.toast("Нет активной смены", error=True)
-            return
 
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Быстрый ввод: " + ("Доход" if kind == "IN" else "Расход"))
-        dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
-        dlg.setModal(False)
-        dlg.resize(420, 240)
+class ShiftDetailsDialog(QDialog):
+    def __init__(self, parent: QWidget, shift: Shift):
+        super().__init__(parent)
+        self.shift = shift
 
-        v = QtWidgets.QVBoxLayout(dlg)
-        v.setContentsMargins(16, 16, 16, 16)
-        v.setSpacing(10)
+        self.setWindowTitle("Смена — детали")
+        self.setModal(True)
+        self.resize(820, 560)
 
-        a = QtWidgets.QLineEdit()
-        a.setPlaceholderText("Сумма")
-        a.setFocus()
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
 
-        c = QtWidgets.QComboBox()
-        if kind == "IN":
-            c.addItems(["Чай", "Согласно тарифу", "Другое"])
-        else:
-            c.addItems(["Аренда авто", "Ремонт", "Заправка", "Штраф", "Другое"])
+        start = iso_to_dt(shift.start_ts)
+        end = iso_to_dt(shift.end_ts) if shift.end_ts else None
 
-        o = QtWidgets.QLineEdit()
-        o.setPlaceholderText("Комментарий для 'Другое'")
-        o.setEnabled(False)
+        title = QLabel(f"Смена • {pretty_date(dt_to_ymd(start))}")
+        title.setObjectName("Title")
+        root.addWidget(title)
 
-        def on_c():
-            o.setEnabled(c.currentText() == "Другое")
-            if not o.isEnabled():
-                o.setText("")
-        c.currentIndexChanged.connect(on_c)
-        on_c()
+        meta = QLabel(f"Начало: {dt_to_pretty(start)}   •   Окончание: {dt_to_pretty(end) if end else '— (активна)'}")
+        meta.setObjectName("Muted")
+        root.addWidget(meta)
 
-        btn = PillButton("Сохранить", primary=True)
-        btn.setDefault(True)
+        total = sum(op.amount for op in shift.operations)
+        total_lbl = QLabel(format_money(total))
+        total_lbl.setObjectName("Kpi")
+        total_lbl.setStyleSheet(f"color: {amount_color(total)};")
+        root.addWidget(total_lbl)
 
-        def save():
-            amount = safe_float(a.text())
-            if amount is None or amount <= 0:
-                self.toast("Некорректная сумма", error=True)
+        table = QTableWidget(self)
+        table.setColumnCount(3)
+        table.setHorizontalHeaderLabels(["Дата/время", "Сумма", "Комментарий"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+
+        ops = list(shift.operations)
+        table.setRowCount(len(ops))
+        for r, op in enumerate(ops):
+            dt = iso_to_dt(op.ts)
+            table.setItem(r, 0, QTableWidgetItem(dt_to_pretty(dt)))
+
+            amt_item = QTableWidgetItem(format_money(op.amount))
+            amt_item.setForeground(Qt.green if op.amount >= 0 else Qt.red)
+            table.setItem(r, 1, amt_item)
+
+            table.setItem(r, 2, QTableWidgetItem(op.comment))
+
+        root.addWidget(table)
+
+        btn = ShimmerButton("Закрыть", kind="neutral")
+        btn.clicked.connect(self.accept)
+        root.addWidget(btn, alignment=Qt.AlignRight)
+
+
+class DayDetailsDialog(QDialog):
+    def __init__(self, parent: QWidget, storage: "Storage", ymd: str):
+        super().__init__(parent)
+        self.storage = storage
+        self.ymd = ymd
+
+        self.setWindowTitle("День — детали")
+        self.setModal(True)
+        self.resize(860, 580)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
+
+        title = QLabel(f"День • {pretty_date(ymd)}")
+        title.setObjectName("Title")
+        root.addWidget(title)
+
+        shifts = [s for s in self.storage.shifts() if dt_to_ymd(iso_to_dt(s.start_ts)) == ymd]
+        shifts = sorted(shifts, key=lambda s: s.start_ts)
+
+        day_total = sum(sum(op.amount for op in s.operations) for s in shifts)
+        kpi = QLabel(format_money(day_total))
+        kpi.setObjectName("Kpi")
+        kpi.setStyleSheet(f"color: {amount_color(day_total)};")
+        root.addWidget(kpi)
+
+        table = QTableWidget(self)
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(["Начало", "Оконч.", "Опер.", "Итог", "ID"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setColumnHidden(4, True)
+
+        table.setRowCount(len(shifts))
+        for r, s in enumerate(shifts):
+            st = iso_to_dt(s.start_ts)
+            en = iso_to_dt(s.end_ts) if s.end_ts else None
+            total = sum(op.amount for op in s.operations)
+
+            table.setItem(r, 0, QTableWidgetItem(dt_to_pretty(st)))
+            table.setItem(r, 1, QTableWidgetItem(dt_to_pretty(en) if en else "—"))
+            table.setItem(r, 2, QTableWidgetItem(str(len(s.operations))))
+
+            ti = QTableWidgetItem(format_money(total))
+            ti.setForeground(Qt.green if total >= 0 else Qt.red)
+            table.setItem(r, 3, ti)
+
+            table.setItem(r, 4, QTableWidgetItem(s.id))
+
+        def open_shift():
+            rr = table.currentRow()
+            if rr < 0:
                 return
-            comment = c.currentText()
-            if comment == "Другое":
-                comment = o.text().strip()
-                if not comment:
-                    self.toast("Введите комментарий", error=True)
+            sid = table.item(rr, 4).text()
+            for s in self.storage.shifts():
+                if s.id == sid:
+                    ShiftDetailsDialog(self, s).exec()
                     return
-            self.db.add_op(int(active["id"]), kind, float(amount), comment)
-            dlg.accept()
-            self.reload_state_from_db()
 
-        btn.clicked.connect(save)
-        a.returnPressed.connect(save)
+        table.doubleClicked.connect(open_shift)
+        root.addWidget(table)
 
-        v.addWidget(a)
-        v.addWidget(c)
-        v.addWidget(o)
-        v.addWidget(btn)
+        btn = ShimmerButton("Закрыть", kind="neutral")
+        btn.clicked.connect(self.accept)
+        root.addWidget(btn, alignment=Qt.AlignRight)
 
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
 
-    # ------------------------- Analytics -------------------------
+# ---------------------------
+# Pages
+# ---------------------------
 
-    def refresh_analytics_filters(self):
-        days = self.db.list_days_desc()
-        cur_day = self.current_day_text
+class ShiftPage(QWidget):
+    def __init__(self, storage: Storage, open_history_cb, open_settings_cb):
+        super().__init__()
+        self.storage = storage
+        self.open_history_cb = open_history_cb
+        self.open_settings_cb = open_settings_cb
 
-        self.day_pick.blockSignals(True)
-        self.day_pick.clear()
-        self.day_pick.addItem("— (все дни периода) —", userData=None)
-        for did, dtxt in days:
-            self.day_pick.addItem(dtxt, userData=did)
-        idx = self.day_pick.findText(cur_day)
-        self.day_pick.setCurrentIndex(idx if idx >= 0 else 0)
-        self.day_pick.blockSignals(False)
+        self._build_ui()
+        self._load_active_shift()
+        self._refresh_comments_based_on_amount()
+        self._refresh_all_time_bar()
 
-        self.day_pick.currentIndexChanged.connect(self.refresh_shift_pick_for_selected_day)
-        self.refresh_shift_pick_for_selected_day()
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(14)
 
-    def refresh_shift_pick_for_selected_day(self):
-        did = self.day_pick.currentData()
-        self.shift_pick.blockSignals(True)
-        self.shift_pick.clear()
-        self.shift_pick.addItem("— (все смены) —", userData=None)
-        if did is not None:
-            shifts = self.db.list_shifts_for_day(int(did))
-            for s in shifts:
-                sid = int(s["id"])
-                st = datetime.fromisoformat(str(s["started_at"])).strftime("%H:%M")
-                en = datetime.fromisoformat(str(s["ended_at"])).strftime("%H:%M") if s["ended_at"] else "—"
-                status = "Активна" if s["status"] == "ACTIVE" else "Закрыта"
-                self.shift_pick.addItem(f"#{sid} • {st}–{en} • {status}", userData=sid)
-        self.shift_pick.blockSignals(False)
+        # Top bar
+        top = QHBoxLayout()
+        top.setSpacing(10)
 
-    def refresh_analytics(self):
-        d_from = self.date_from.date().toPython()
-        d_to = self.date_to.date().toPython()
-        if d_from > d_to:
-            d_from, d_to = d_to, d_from
+        brand = QLabel("🚕  Калькулятор таксиста")
+        brand.setObjectName("Title")
+        top.addWidget(brand)
 
-        did = self.day_pick.currentData()
-        sid = self.shift_pick.currentData()
+        chip = QLabel("Overlay")
+        chip.setObjectName("Chip")
+        top.addWidget(chip)
 
-        if sid is not None:
-            shifts = self.db._query("""
-                SELECT s.*, d.day_text
-                FROM shifts s JOIN days d ON d.id=s.day_id
-                WHERE s.id=?
-            """, (int(sid),))
-        elif did is not None:
-            shifts = self.db._query("""
-                SELECT s.*, d.day_text
-                FROM shifts s JOIN days d ON d.id=s.day_id
-                WHERE s.day_id=?
-                ORDER BY s.id DESC
-            """, (int(did),))
+        top.addStretch(1)
+
+        self.btn_back = ShimmerButton("Свернуть", kind="neutral")
+        self.btn_back.clicked.connect(self._go_back)
+        top.addWidget(self.btn_back)
+
+        self.btn_new_shift = ShimmerButton("Новая смена", kind="primary")
+        self.btn_new_shift.clicked.connect(self._new_shift)
+        top.addWidget(self.btn_new_shift)
+
+        self.btn_reset = ShimmerButton("Сбросить смену", kind="danger")
+        self.btn_reset.clicked.connect(self._reset_shift)
+        top.addWidget(self.btn_reset)
+
+        self.btn_history = ShimmerButton("История", kind="neutral")
+        self.btn_history.clicked.connect(self.open_history_cb)
+        top.addWidget(self.btn_history)
+
+        self.btn_settings = ShimmerButton("Настройки", kind="neutral")
+        self.btn_settings.clicked.connect(self.open_settings_cb)
+        top.addWidget(self.btn_settings)
+
+        root.addLayout(top)
+
+        # Content
+        content = QHBoxLayout()
+        content.setSpacing(14)
+
+        # Left column
+        left_col = QVBoxLayout()
+        left_col.setSpacing(14)
+
+        add_card = Card()
+        add_l = QVBoxLayout(add_card)
+        add_l.setContentsMargins(16, 16, 16, 16)
+        add_l.setSpacing(12)
+
+        h = QLabel("Добавить операцию")
+        h.setObjectName("Section")
+        add_l.addWidget(h)
+
+        self.amount_edit = QLineEdit()
+        self.amount_edit.setPlaceholderText("Сумма (например: 12 000 или -5 000)")
+        self.amount_edit.textChanged.connect(self._refresh_comments_based_on_amount)
+        add_l.addWidget(self.amount_edit)
+
+        self.comment_combo = QComboBox()
+        self.comment_combo.setEnabled(False)
+        add_l.addWidget(self.comment_combo)
+
+        self.btn_save = ShimmerButton("Сохранить", kind="primary")
+        self.btn_save.clicked.connect(self._save_operation)
+        add_l.addWidget(self.btn_save)
+
+        left_col.addWidget(add_card)
+
+        # KPI card
+        kpi_card = Card(soft=True)
+        kpi_l = QVBoxLayout(kpi_card)
+        kpi_l.setContentsMargins(16, 16, 16, 16)
+        kpi_l.setSpacing(8)
+
+        t = QLabel("Итог текущей смены")
+        t.setObjectName("Muted")
+        kpi_l.addWidget(t)
+
+        self.total_label_value = QLabel("0")
+        self.total_label_value.setObjectName("Kpi")
+        kpi_l.addWidget(self.total_label_value)
+
+        self.shift_info = QLabel("")
+        self.shift_info.setObjectName("Muted")
+        kpi_l.addWidget(self.shift_info)
+
+        left_col.addWidget(kpi_card)
+        left_col.addStretch(1)
+
+        content.addLayout(left_col, 1)
+
+        # Right operations
+        right_card = Card()
+        right_l = QVBoxLayout(right_card)
+        right_l.setContentsMargins(16, 16, 16, 16)
+        right_l.setSpacing(12)
+
+        ttl = QLabel("Операции смены")
+        ttl.setObjectName("Section")
+        right_l.addWidget(ttl)
+
+        self.empty_hint = QLabel("Нет операций")
+        self.empty_hint.setAlignment(Qt.AlignCenter)
+        self.empty_hint.setObjectName("Muted")
+        self.empty_hint.setStyleSheet("padding: 26px; font-weight: 900;")
+        right_l.addWidget(self.empty_hint)
+
+        self.ops_list = QListWidget()
+        self.ops_list.setSpacing(10)
+        self.ops_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.ops_list.customContextMenuRequested.connect(self._ops_context_menu)
+        self.ops_list.itemClicked.connect(self._open_operation_from_item)
+        right_l.addWidget(self.ops_list)
+
+        content.addWidget(right_card, 2)
+
+        root.addLayout(content)
+
+        # Bottom all-time summary bar
+        bottom = Card(soft=True)
+        b = QHBoxLayout(bottom)
+        b.setContentsMargins(16, 12, 16, 12)
+        b.setSpacing(16)
+
+        tag = QLabel("За всё время:")
+        tag.setObjectName("Muted")
+        tag.setStyleSheet("font-weight: 950;")
+        b.addWidget(tag)
+
+        self.all_income = QLabel("Доход: 0")
+        self.all_income.setObjectName("KpiSmall")
+        self.all_income.setStyleSheet("color: #2EE6A6;")
+        b.addWidget(self.all_income)
+
+        self.all_expense = QLabel("Расход: 0")
+        self.all_expense.setObjectName("KpiSmall")
+        self.all_expense.setStyleSheet("color: #FF5B77;")
+        b.addWidget(self.all_expense)
+
+        b.addStretch(1)
+
+        self.all_net = QLabel("Чистая прибыль: 0")
+        self.all_net.setObjectName("KpiSmall")
+        b.addWidget(self.all_net)
+
+        root.addWidget(bottom)
+
+    def _go_back(self):
+        w = self.window()
+        if isinstance(w, QMainWindow):
+            w.showMinimized()
+
+    def _load_active_shift(self):
+        self.active_shift = self.storage.get_active_shift()
+        self._render_shift()
+
+    def _render_shift(self):
+        s = self.active_shift
+        start_dt = iso_to_dt(s.start_ts)
+        end_dt = iso_to_dt(s.end_ts) if s.end_ts else None
+
+        info = f"{pretty_date(dt_to_ymd(start_dt))} • {dt_to_pretty(start_dt)}"
+        info += f" — {dt_to_pretty(end_dt)}" if end_dt else " — активна"
+        self.shift_info.setText(info)
+
+        total = sum(op.amount for op in s.operations)
+        self.total_label_value.setText(format_money(total))
+        self.total_label_value.setStyleSheet(f"color: {amount_color(total)};")
+
+        self.ops_list.clear()
+        if not s.operations:
+            self.empty_hint.show()
+            self.ops_list.hide()
+            return
+
+        self.empty_hint.hide()
+        self.ops_list.show()
+
+        for op in reversed(s.operations):
+            dt = iso_to_dt(op.ts)
+            widget = OperationCard(dt_to_short(dt), op.comment, op.amount)
+
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, op.id)
+            item.setSizeHint(QSize(10, 78))
+            self.ops_list.addItem(item)
+            self.ops_list.setItemWidget(item, widget)
+
+    def _refresh_comments_based_on_amount(self):
+        amt = parse_amount(self.amount_edit.text())
+        self.comment_combo.clear()
+        self.comment_combo.setEnabled(False)
+
+        if amt is None or amt == 0:
+            self.comment_combo.addItem("Введите сумму")
+            return
+
+        comments = self.storage.get_comments()
+        if amt > 0:
+            choices = comments.get("income", [])
+            self.comment_combo.addItem(HEADER_INCOME)
         else:
-            shifts = self.db.list_shifts_in_range(day_key(d_from), day_key(d_to))
+            choices = comments.get("expense", [])
+            self.comment_combo.addItem(HEADER_EXPENSE)
 
-        total_inc = total_exp = 0.0
-        total_sec = 0
-        shift_count = 0
-        expense_by_comment: Dict[str, float] = {}
+        for c in choices:
+            self.comment_combo.addItem(c)
 
+        # Всегда добавляем "Другое" (ввод вручную)
+        self.comment_combo.addItem(OTHER_COMMENT_TEXT)
+
+        self.comment_combo.setEnabled(True)
+        self.comment_combo.setCurrentIndex(0)
+
+    def _save_operation(self):
+        amt = parse_amount(self.amount_edit.text())
+        if amt is None or amt == 0:
+            QMessageBox.warning(self, "Ошибка", "Введите корректную сумму (не 0).")
+            return
+        if not self.comment_combo.isEnabled() or self.comment_combo.currentIndex() <= 0:
+            QMessageBox.warning(self, "Ошибка", "Выберите комментарий.")
+            return
+
+        chosen = self.comment_combo.currentText().strip()
+        if chosen in (HEADER_INCOME, HEADER_EXPENSE) or not chosen:
+            QMessageBox.warning(self, "Ошибка", "Выберите комментарий.")
+            return
+
+        if chosen == OTHER_COMMENT_TEXT:
+            text, ok = QInputDialog.getText(self, "Комментарий", "Введите комментарий:")
+            if not ok:
+                return
+            manual = (text or "").strip()
+            if not manual:
+                QMessageBox.warning(self, "Ошибка", "Комментарий не может быть пустым.")
+                return
+            comment = manual
+        else:
+            comment = chosen
+
+        self.storage.add_operation_to_active(amt, comment)
+        self.active_shift = self.storage.get_active_shift()
+        self._render_shift()
+        self._refresh_all_time_bar()
+
+        self.amount_edit.clear()
+        self.comment_combo.setCurrentIndex(0)
+        self.comment_combo.setEnabled(False)
+
+    def _new_shift(self):
+        self.storage.end_shift_and_create_new()
+        self._load_active_shift()
+        self.amount_edit.clear()
+        self._refresh_comments_based_on_amount()
+        self._refresh_all_time_bar()
+
+    def _reset_shift(self):
+        ans = QMessageBox.question(
+            self,
+            "Сбросить смену",
+            "Удалить все операции в текущей активной смене?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+        self.storage.reset_current_shift_operations()
+        self._load_active_shift()
+        self.amount_edit.clear()
+        self._refresh_comments_based_on_amount()
+        self._refresh_all_time_bar()
+
+    def _ops_context_menu(self, pos):
+        item = self.ops_list.itemAt(pos)
+        if not item:
+            return
+        op_id = item.data(Qt.UserRole)
+
+        menu = QMenu(self)
+        act_open = QAction("Открыть детали", self)
+        act_del = QAction("Удалить", self)
+        menu.addAction(act_open)
+        menu.addSeparator()
+        menu.addAction(act_del)
+
+        act_open.triggered.connect(lambda: self._open_operation_by_id(op_id))
+
+        def do_del():
+            ans = QMessageBox.question(
+                self, "Удаление", "Удалить выбранную операцию?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if ans != QMessageBox.Yes:
+                return
+            self.storage.delete_operation_from_active(op_id)
+            self.active_shift = self.storage.get_active_shift()
+            self._render_shift()
+            self._refresh_all_time_bar()
+
+        act_del.triggered.connect(do_del)
+        menu.exec(QCursor.pos())
+
+    def _open_operation_from_item(self, item: QListWidgetItem):
+        op_id = item.data(Qt.UserRole)
+        self._open_operation_by_id(op_id)
+
+    def _open_operation_by_id(self, op_id: str):
+        found = self.storage.find_operation(op_id)
+        if not found:
+            QMessageBox.warning(self, "Не найдено", "Операция не найдена.")
+            self._load_active_shift()
+            return
+        shift, op = found
+        OperationDetailsDialog(self, self.storage, shift, op).exec()
+
+        # после закрытия — обновим (вдруг удалили)
+        self.active_shift = self.storage.get_active_shift()
+        self._render_shift()
+        self._refresh_all_time_bar()
+
+    def _refresh_all_time_bar(self):
+        inc, exp, net = self.storage.totals_all_time()
+        self.all_income.setText(f"Доход: {format_money(inc)}")
+        self.all_expense.setText(f"Расход: {format_money(exp)}")
+        self.all_net.setText(f"Чистая прибыль: {format_money(net)}")
+        self.all_net.setStyleSheet(f"color: {amount_color(net)}; font-size: 14px; font-weight: 950;")
+
+
+class HistoryPage(QWidget):
+    def __init__(self, storage: Storage, back_cb):
+        super().__init__()
+        self.storage = storage
+        self.back_cb = back_cb
+        self._build_ui()
+        self.refresh()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(14)
+
+        top = QHBoxLayout()
+        btn_back = ShimmerButton("Назад", kind="neutral")
+        btn_back.clicked.connect(self.back_cb)
+        top.addWidget(btn_back)
+
+        title = QLabel("История")
+        title.setObjectName("Title")
+        top.addWidget(title)
+        top.addStretch(1)
+
+        btn_refresh = ShimmerButton("Обновить", kind="neutral")
+        btn_refresh.clicked.connect(self.refresh)
+        top.addWidget(btn_refresh)
+
+        root.addLayout(top)
+
+        card = Card()
+        c_l = QVBoxLayout(card)
+        c_l.setContentsMargins(16, 16, 16, 16)
+        c_l.setSpacing(12)
+
+        self.tabs = QTabWidget()
+        c_l.addWidget(self.tabs)
+
+        # --- Shifts tab ---
+        self.tab_shifts = QWidget()
+        t1 = QHBoxLayout(self.tab_shifts)
+        t1.setContentsMargins(0, 0, 0, 0)
+        t1.setSpacing(12)
+
+        sp1 = QSplitter(Qt.Horizontal)
+
+        left_box = QWidget()
+        l = QVBoxLayout(left_box)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(10)
+
+        self.shifts_table = QTableWidget()
+        self.shifts_table.setColumnCount(6)
+        self.shifts_table.setHorizontalHeaderLabels(["Дата", "Начало", "Оконч.", "Опер.", "Итог", "ID"])
+        self.shifts_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.shifts_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.shifts_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.shifts_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.shifts_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.shifts_table.setColumnHidden(5, True)
+        self.shifts_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.shifts_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.shifts_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.shifts_table.itemSelectionChanged.connect(self._render_shift_preview)
+        self.shifts_table.doubleClicked.connect(self._open_selected_shift)
+        l.addWidget(self.shifts_table)
+
+        right_box = Card(soft=True)
+        rr = QVBoxLayout(right_box)
+        rr.setContentsMargins(14, 14, 14, 14)
+        rr.setSpacing(10)
+
+        prev_title = QLabel("Смена — детали")
+        prev_title.setObjectName("Section")
+        rr.addWidget(prev_title)
+
+        self.shift_preview = QTextEdit()
+        self.shift_preview.setReadOnly(True)
+        self.shift_preview.setMinimumWidth(340)
+        rr.addWidget(self.shift_preview)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        self.btn_open_shift = ShimmerButton("Открыть", kind="primary")
+        self.btn_open_shift.clicked.connect(self._open_selected_shift)
+        btns.addWidget(self.btn_open_shift)
+        rr.addLayout(btns)
+
+        sp1.addWidget(left_box)
+        sp1.addWidget(right_box)
+        sp1.setStretchFactor(0, 3)
+        sp1.setStretchFactor(1, 2)
+
+        t1.addWidget(sp1)
+        self.tabs.addTab(self.tab_shifts, "Смены")
+
+        # --- Days tab ---
+        self.tab_days = QWidget()
+        t2 = QHBoxLayout(self.tab_days)
+        t2.setContentsMargins(0, 0, 0, 0)
+        t2.setSpacing(12)
+
+        sp2 = QSplitter(Qt.Horizontal)
+
+        left2 = QWidget()
+        l2 = QVBoxLayout(left2)
+        l2.setContentsMargins(0, 0, 0, 0)
+        l2.setSpacing(10)
+
+        self.days_table = QTableWidget()
+        self.days_table.setColumnCount(4)
+        self.days_table.setHorizontalHeaderLabels(["Дата", "Смен", "Итог дня", "YMD"])
+        self.days_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.days_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.days_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.days_table.setColumnHidden(3, True)
+        self.days_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.days_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.days_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.days_table.itemSelectionChanged.connect(self._render_day_preview)
+        self.days_table.doubleClicked.connect(self._open_selected_day)
+        l2.addWidget(self.days_table)
+
+        right2 = Card(soft=True)
+        r2 = QVBoxLayout(right2)
+        r2.setContentsMargins(14, 14, 14, 14)
+        r2.setSpacing(10)
+
+        prev2 = QLabel("День — детали")
+        prev2.setObjectName("Section")
+        r2.addWidget(prev2)
+
+        self.day_preview = QTextEdit()
+        self.day_preview.setReadOnly(True)
+        self.day_preview.setMinimumWidth(340)
+        r2.addWidget(self.day_preview)
+
+        btns2 = QHBoxLayout()
+        btns2.addStretch(1)
+        self.btn_open_day = ShimmerButton("Открыть", kind="primary")
+        self.btn_open_day.clicked.connect(self._open_selected_day)
+        btns2.addWidget(self.btn_open_day)
+        r2.addLayout(btns2)
+
+        sp2.addWidget(left2)
+        sp2.addWidget(right2)
+        sp2.setStretchFactor(0, 3)
+        sp2.setStretchFactor(1, 2)
+
+        t2.addWidget(sp2)
+        self.tabs.addTab(self.tab_days, "Дни")
+
+        root.addWidget(card)
+
+    def refresh(self):
+        shifts = sorted(self.storage.shifts(), key=lambda s: s.start_ts, reverse=True)
+
+        self.shifts_table.setRowCount(len(shifts))
+        for r, s in enumerate(shifts):
+            start_dt = iso_to_dt(s.start_ts)
+            end_dt = iso_to_dt(s.end_ts) if s.end_ts else None
+            total = sum(op.amount for op in s.operations)
+
+            self.shifts_table.setItem(r, 0, QTableWidgetItem(pretty_date(dt_to_ymd(start_dt))))
+            self.shifts_table.setItem(r, 1, QTableWidgetItem(dt_to_pretty(start_dt)))
+            self.shifts_table.setItem(r, 2, QTableWidgetItem(dt_to_pretty(end_dt) if end_dt else "—"))
+            self.shifts_table.setItem(r, 3, QTableWidgetItem(str(len(s.operations))))
+
+            total_item = QTableWidgetItem(format_money(total))
+            total_item.setForeground(Qt.green if total >= 0 else Qt.red)
+            self.shifts_table.setItem(r, 4, total_item)
+
+            it_id = QTableWidgetItem(s.id)
+            self.shifts_table.setItem(r, 5, it_id)
+
+        if self.shifts_table.rowCount() > 0:
+            self.shifts_table.selectRow(0)
+        else:
+            self.shift_preview.setPlainText("Нет смен.")
+
+        # days aggregation
+        day_map: Dict[str, Dict[str, int]] = {}
         for s in shifts:
-            sid0 = int(s["id"])
-            inc, exp = self.db.sums_for_shift(sid0)
-            total_inc += inc
-            total_exp += exp
+            ymd = dt_to_ymd(iso_to_dt(s.start_ts))
+            day_map.setdefault(ymd, {"shifts": 0, "total": 0, "ops": 0})
+            day_map[ymd]["shifts"] += 1
+            day_map[ymd]["total"] += sum(op.amount for op in s.operations)
+            day_map[ymd]["ops"] += len(s.operations)
 
-            st = datetime.fromisoformat(str(s["started_at"]))
-            en = datetime.fromisoformat(str(s["ended_at"])) if s["ended_at"] else now_local()
-            total_sec += max(0, int((en - st).total_seconds()))
-            shift_count += 1
+        days_sorted = sorted(day_map.items(), key=lambda kv: kv[0], reverse=True)
+        self.days_table.setRowCount(len(days_sorted))
+        for r, (ymd, info) in enumerate(days_sorted):
+            self.days_table.setItem(r, 0, QTableWidgetItem(pretty_date(ymd)))
+            self.days_table.setItem(r, 1, QTableWidgetItem(str(info["shifts"])))
 
-            for o in self.db.list_ops_for_shift(sid0):
-                if o["kind"] == "OUT":
-                    c = str(o["comment"])
-                    expense_by_comment[c] = expense_by_comment.get(c, 0.0) + float(o["amount"])
+            tot = info["total"]
+            tot_item = QTableWidgetItem(format_money(tot))
+            tot_item.setForeground(Qt.green if tot >= 0 else Qt.red)
+            self.days_table.setItem(r, 2, tot_item)
 
-        profit = total_inc - total_exp
-        hours = total_sec / 3600.0 if total_sec > 0 else 0.0
-        inc_h = (total_inc / hours) if hours > 0 else 0.0
-        profit_h = (profit / hours) if hours > 0 else 0.0
-        avg_profit = (profit / shift_count) if shift_count > 0 else 0.0
+            self.days_table.setItem(r, 3, QTableWidgetItem(ymd))
 
-        self.a_inc.set_value(fmt_money(total_inc))
-        self.a_exp.set_value(fmt_money(total_exp))
-        self.a_profit.set_value(fmt_money(profit))
-        self.a_shifts.set_value(str(shift_count))
-        self.a_time.set_value(fmt_duration(total_sec))
-        self.a_inc_h.set_value(fmt_money(inc_h))
-        self.a_profit_h.set_value(fmt_money(profit_h))
-        self.a_avg.set_value(fmt_money(avg_profit))
-
-        # chart by days (if not single shift)
-        labels: List[str] = []
-        incs: List[float] = []
-        exps: List[float] = []
-        pros: List[float] = []
-
-        if sid is None:
-            dd = d_from
-            while dd <= d_to:
-                txt = day_key(dd)
-                did0 = self.db.get_day_id_by_text(txt)
-                if did0 is not None:
-                    inc_d, exp_d, _ = self.db.sums_for_day(int(did0))
-                else:
-                    inc_d, exp_d = 0.0, 0.0
-                if did is None or (self.day_pick.currentText() == txt):
-                    labels.append(txt[:5])  # DD-MM
-                    incs.append(inc_d)
-                    exps.append(exp_d)
-                    pros.append(inc_d - exp_d)
-                dd += timedelta(days=1)
-
-        if labels:
-            self.chart_main.draw_bars(labels, incs, exps, pros)
+        if self.days_table.rowCount() > 0:
+            self.days_table.selectRow(0)
         else:
-            self.chart_main.clear()
-            self.chart_main.ax.text(0.5, 0.5, "Нет данных", ha="center", va="center")
-            self.chart_main.ax.axis("off")
-            self.chart_main.draw()
+            self.day_preview.setPlainText("Нет данных по дням.")
 
-        pairs = sorted(expense_by_comment.items(), key=lambda x: x[1], reverse=True)[:10]
-        pie_labels = [p[0] for p in pairs]
-        pie_vals = [p[1] for p in pairs]
-        self.chart_pie.draw_pie(pie_labels, pie_vals, "Расходы")
+    def _selected_shift_id(self) -> Optional[str]:
+        r = self.shifts_table.currentRow()
+        if r < 0:
+            return None
+        it = self.shifts_table.item(r, 5)
+        return it.text() if it else None
 
-        self._fill_shifts_table(shifts)
+    def _selected_day_ymd(self) -> Optional[str]:
+        r = self.days_table.currentRow()
+        if r < 0:
+            return None
+        it = self.days_table.item(r, 3)
+        return it.text() if it else None
 
-    def _fill_shifts_table(self, shifts: List[sqlite3.Row]):
-        self.table_shifts.setRowCount(len(shifts))
-        for i, s in enumerate(shifts):
-            sid = int(s["id"])
-            day_txt = str(s["day_text"]) if "day_text" in s.keys() else "—"
-            st = datetime.fromisoformat(str(s["started_at"]))
-            en = datetime.fromisoformat(str(s["ended_at"])) if s["ended_at"] else now_local()
-
-            inc, exp = self.db.sums_for_shift(sid)
-            profit = inc - exp
-            dur = int((en - st).total_seconds())
-
-            vals = [
-                day_txt,
-                str(sid),
-                st.strftime("%H:%M:%S"),
-                en.strftime("%H:%M:%S") if s["ended_at"] else "—",
-                fmt_money(inc),
-                fmt_money(exp),
-                fmt_money(profit),
-                fmt_duration(dur),
-            ]
-            for c, v in enumerate(vals):
-                self.table_shifts.setItem(i, c, QtWidgets.QTableWidgetItem(v))
-
-        self.table_shifts.resizeColumnsToContents()
-        self.table_ops.setRowCount(0)
-
-    def on_shift_table_selected(self):
-        items = self.table_shifts.selectedItems()
-        if not items:
-            return
-        sid_item = self.table_shifts.item(items[0].row(), 1)
-        if not sid_item:
-            return
-        try:
-            sid = int(sid_item.text())
-        except Exception:
+    def _render_shift_preview(self):
+        sid = self._selected_shift_id()
+        if not sid:
+            self.shift_preview.setPlainText("Выберите смену.")
             return
 
-        ops = self.db.list_ops_for_shift(sid)
-        self.table_ops.setRowCount(len(ops))
-        for i, o in enumerate(ops):
-            ts = datetime.fromisoformat(str(o["ts"])).strftime("%H:%M:%S")
-            kind = "Доход" if o["kind"] == "IN" else "Расход"
-            amt = fmt_money(float(o["amount"]))
-            com = str(o["comment"])
-            self.table_ops.setItem(i, 0, QtWidgets.QTableWidgetItem(ts))
-            self.table_ops.setItem(i, 1, QtWidgets.QTableWidgetItem(kind))
-            self.table_ops.setItem(i, 2, QtWidgets.QTableWidgetItem(amt))
-            self.table_ops.setItem(i, 3, QtWidgets.QTableWidgetItem(com))
-        self.table_ops.resizeColumnsToContents()
+        for s in self.storage.shifts():
+            if s.id == sid:
+                start = iso_to_dt(s.start_ts)
+                end = iso_to_dt(s.end_ts) if s.end_ts else None
+                total = sum(op.amount for op in s.operations)
 
-    # ------------------------- Settings / hotkeys UI -------------------------
+                # 6 последних операций
+                ops = list(reversed(s.operations))[:6]
+                lines = []
+                for op in ops:
+                    dt = iso_to_dt(op.ts)
+                    sign = "+" if op.amount >= 0 else ""
+                    lines.append(f"• {dt_to_pretty(dt)}   {sign}{format_money(op.amount)}   — {op.comment}")
+                if not lines:
+                    lines = ["— операций нет"]
 
-    def reload_hotkeys_labels(self):
-        self.hk_toggle_lbl.setText(self.db.get_setting("hotkey_toggle") or "—")
-        self.hk_income_lbl.setText(self.db.get_setting("hotkey_quick_income") or "—")
-        self.hk_expense_lbl.setText(self.db.get_setting("hotkey_quick_expense") or "—")
-        self.hk_shot_lbl.setText(self.db.get_setting("hotkey_screenshot") or "—")
+                txt = (
+                    f"Дата: {pretty_date(dt_to_ymd(start))}\n"
+                    f"Начало: {dt_to_pretty(start)}\n"
+                    f"Окончание: {dt_to_pretty(end) if end else '— (активна)'}\n"
+                    f"Операций: {len(s.operations)}\n"
+                    f"Итог: {format_money(total)}\n\n"
+                    "Последние операции:\n" + "\n".join(lines)
+                )
+                self.shift_preview.setPlainText(txt)
+                return
 
-    def change_hotkey(self, setting_key: str):
-        current = self.db.get_setting(setting_key) or ""
-        dlg = HotkeyCaptureDialog(current, self)
-        if dlg.exec() == QtWidgets.QDialog.Accepted and dlg.result_hotkey:
-            self.db.set_setting(setting_key, dlg.result_hotkey)
-            self.reload_hotkeys_labels()
-            self.restart_hotkeys_from_settings()
-            self.toast("Хоткей сохранён: " + dlg.result_hotkey)
+        self.shift_preview.setPlainText("Смена не найдена.")
 
-    # ------------------------- Data refresh -------------------------
-
-    def reload_state_from_db(self):
-        days = self.db.list_days_desc()
-        if days:
-            if self.db.get_day_id_by_text(self.current_day_text) is None:
-                self.current_day_text = days[0][1]
-        else:
-            self.current_day_text = day_key(date.today())
-            self.db.ensure_day(date.today())
-
-        self.lbl_day.setText(self.current_day_text)
-
-        active = self.db.get_active_shift()
-        self.active_shift_id = int(active["id"]) if active else None
-
-        self.refresh_shift_ui()
-        self.refresh_analytics_filters()
-        self.refresh_analytics()
-        self.reload_hotkeys_labels()
-
-    def refresh_shift_summary_only(self):
-        active = self.db.get_active_shift()
-        if not active:
-            if self.active_shift_id is not None:
-                self.reload_state_from_db()
+    def _render_day_preview(self):
+        ymd = self._selected_day_ymd()
+        if not ymd:
+            self.day_preview.setPlainText("Выберите день.")
             return
 
-        sid = int(active["id"])
-        inc, exp = self.db.sums_for_shift(sid)
-        profit = inc - exp
-        st = datetime.fromisoformat(str(active["started_at"]))
-        dur = int((now_local() - st).total_seconds())
+        shifts = [s for s in self.storage.shifts() if dt_to_ymd(iso_to_dt(s.start_ts)) == ymd]
+        shifts = sorted(shifts, key=lambda s: s.start_ts)
 
-        self.card_status.set_value(f"Активна • #{sid}", "Shift")
-        self.card_inc.set_value(fmt_money(inc))
-        self.card_exp.set_value(fmt_money(exp))
-        self.card_profit.set_value(fmt_money(profit))
-        self.card_time.set_value(fmt_duration(dur))
+        day_total = sum(sum(op.amount for op in s.operations) for s in shifts)
+        ops_total = sum(len(s.operations) for s in shifts)
 
-    def refresh_shift_ui(self):
-        active = self.db.get_active_shift()
-        if not active:
-            self.card_status.set_value("Нет активной", "Shift")
-            self.card_inc.set_value("0")
-            self.card_exp.set_value("0")
-            self.card_profit.set_value("0")
-            self.card_time.set_value("0с")
-            self.btn_start_shift.setEnabled(True)
-            self.btn_end_shift.setEnabled(False)
-            self.ops_table.setRowCount(0)
+        # 8 смен в превью
+        lines = []
+        for s in shifts[:8]:
+            st = iso_to_dt(s.start_ts)
+            en = iso_to_dt(s.end_ts) if s.end_ts else None
+            tot = sum(op.amount for op in s.operations)
+            lines.append(f"• {dt_to_pretty(st)} — {dt_to_pretty(en) if en else '—'}   |   опер.: {len(s.operations)}   |   итог: {format_money(tot)}")
+        if not lines:
+            lines = ["— смен нет"]
+        if len(shifts) > 8:
+            lines.append(f"… и ещё {len(shifts)-8} смен(ы).")
+
+        txt = (
+            f"День: {pretty_date(ymd)}\n"
+            f"Смен: {len(shifts)}\n"
+            f"Операций: {ops_total}\n"
+            f"Итог дня: {format_money(day_total)}\n\n"
+            "Смены:\n" + "\n".join(lines)
+        )
+        self.day_preview.setPlainText(txt)
+
+    def _open_selected_shift(self):
+        sid = self._selected_shift_id()
+        if not sid:
+            return
+        for s in self.storage.shifts():
+            if s.id == sid:
+                ShiftDetailsDialog(self, s).exec()
+                return
+
+    def _open_selected_day(self):
+        ymd = self._selected_day_ymd()
+        if not ymd:
+            return
+        DayDetailsDialog(self, self.storage, ymd).exec()
+
+
+class SettingsPage(QWidget):
+    def __init__(self, storage: Storage, back_cb, apply_overlay_cb, after_reset_cb):
+        super().__init__()
+        self.storage = storage
+        self.back_cb = back_cb
+        self.apply_overlay_cb = apply_overlay_cb
+        self.after_reset_cb = after_reset_cb
+        self._build_ui()
+        self.refresh()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(14)
+
+        top = QHBoxLayout()
+        btn_back = ShimmerButton("Назад", kind="neutral")
+        btn_back.clicked.connect(self.back_cb)
+        top.addWidget(btn_back)
+
+        title = QLabel("Настройки")
+        title.setObjectName("Title")
+        top.addWidget(title)
+        top.addStretch(1)
+
+        btn_save = ShimmerButton("Сохранить", kind="primary")
+        btn_save.clicked.connect(self.save_settings)
+        top.addWidget(btn_save)
+
+        root.addLayout(top)
+
+        card = Card()
+        c = QVBoxLayout(card)
+        c.setContentsMargins(16, 16, 16, 16)
+        c.setSpacing(14)
+
+        # Comments
+        comm_title = QLabel("Шаблоны комментариев")
+        comm_title.setObjectName("Section")
+        c.addWidget(comm_title)
+
+        split = QHBoxLayout()
+        split.setSpacing(14)
+
+        income_box = Card(soft=True)
+        il = QVBoxLayout(income_box)
+        il.setContentsMargins(14, 14, 14, 14)
+        il.setSpacing(10)
+
+        il.addWidget(self._section_header("Доходы"))
+        self.income_list = QListWidget()
+        il.addWidget(self.income_list)
+
+        ibtns = QHBoxLayout()
+        self.btn_income_add = ShimmerButton("Добавить", kind="neutral")
+        self.btn_income_rename = ShimmerButton("Переименовать", kind="neutral")
+        self.btn_income_del = ShimmerButton("Удалить", kind="danger")
+        ibtns.addWidget(self.btn_income_add)
+        ibtns.addWidget(self.btn_income_rename)
+        ibtns.addWidget(self.btn_income_del)
+        il.addLayout(ibtns)
+
+        self.btn_income_add.clicked.connect(lambda: self._add_comment(True))
+        self.btn_income_rename.clicked.connect(lambda: self._rename_comment(True))
+        self.btn_income_del.clicked.connect(lambda: self._delete_comment(True))
+
+        expense_box = Card(soft=True)
+        el = QVBoxLayout(expense_box)
+        el.setContentsMargins(14, 14, 14, 14)
+        el.setSpacing(10)
+
+        el.addWidget(self._section_header("Расходы"))
+        self.expense_list = QListWidget()
+        el.addWidget(self.expense_list)
+
+        ebtns = QHBoxLayout()
+        self.btn_exp_add = ShimmerButton("Добавить", kind="neutral")
+        self.btn_exp_rename = ShimmerButton("Переименовать", kind="neutral")
+        self.btn_exp_del = ShimmerButton("Удалить", kind="danger")
+        ebtns.addWidget(self.btn_exp_add)
+        ebtns.addWidget(self.btn_exp_rename)
+        ebtns.addWidget(self.btn_exp_del)
+        el.addLayout(ebtns)
+
+        self.btn_exp_add.clicked.connect(lambda: self._add_comment(False))
+        self.btn_exp_rename.clicked.connect(lambda: self._rename_comment(False))
+        self.btn_exp_del.clicked.connect(lambda: self._delete_comment(False))
+
+        split.addWidget(income_box, 1)
+        split.addWidget(expense_box, 1)
+        c.addLayout(split)
+
+        # Note about OTHER
+        note = QLabel(f"Примечание: пункт «{OTHER_COMMENT_TEXT}» всегда доступен и не удаляется.")
+        note.setObjectName("Muted")
+        c.addWidget(note)
+
+        # Overlay settings
+        overlay_title = QLabel("Оверлей")
+        overlay_title.setObjectName("Section")
+        c.addWidget(overlay_title)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignLeft)
+        form.setFormAlignment(Qt.AlignLeft)
+
+        self.chk_on_top = QCheckBox("Всегда поверх окон (always-on-top)")
+        self.chk_frameless = QCheckBox("Без рамки окна (frameless)")
+        self.spn_opacity = QSpinBox()
+        self.spn_opacity.setRange(30, 100)
+        self.spn_opacity.setSuffix(" %")
+
+        form.addRow(self.chk_on_top)
+        form.addRow(self.chk_frameless)
+        form.addRow("Прозрачность:", self.spn_opacity)
+        c.addLayout(form)
+
+        # Full reset
+        danger_card = Card(soft=True)
+        dl = QVBoxLayout(danger_card)
+        dl.setContentsMargins(14, 14, 14, 14)
+        dl.setSpacing(10)
+
+        dtitle = QLabel("Сброс данных")
+        dtitle.setObjectName("Section")
+        dl.addWidget(dtitle)
+
+        self.btn_reset_all = ShimmerButton("Удалить всю историю (за все периоды)", kind="danger")
+        self.btn_reset_all.clicked.connect(self._reset_all)
+        dl.addWidget(self.btn_reset_all)
+
+        c.addWidget(danger_card)
+
+        root.addWidget(card)
+
+    def _section_header(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setObjectName("Section")
+        return lbl
+
+    def refresh(self):
+        comm = self.storage.get_comments()
+        self.income_list.clear()
+        self.expense_list.clear()
+        for x in comm.get("income", []):
+            self.income_list.addItem(x)
+        for x in comm.get("expense", []):
+            self.expense_list.addItem(x)
+
+        o = self.storage.get_overlay_settings()
+        self.chk_on_top.setChecked(o["always_on_top"])
+        self.chk_frameless.setChecked(o["frameless"])
+        self.spn_opacity.setValue(o["opacity"])
+
+    def save_settings(self):
+        income = [self.income_list.item(i).text().strip() for i in range(self.income_list.count())]
+        expense = [self.expense_list.item(i).text().strip() for i in range(self.expense_list.count())]
+        income = [x for x in income if x and x != OTHER_COMMENT_TEXT]
+        expense = [x for x in expense if x and x != OTHER_COMMENT_TEXT]
+
+        if not income:
+            income = default_comments()["income"][:]
+        if not expense:
+            expense = default_comments()["expense"][:]
+
+        self.storage.set_comments(income, expense)
+        self.storage.set_overlay_settings(
+            always_on_top=self.chk_on_top.isChecked(),
+            opacity=self.spn_opacity.value(),
+            frameless=self.chk_frameless.isChecked(),
+        )
+        self.apply_overlay_cb()
+        QMessageBox.information(self, "Сохранено", "Настройки сохранены.")
+
+    def _add_comment(self, is_income: bool):
+        title = "Добавить (доход)" if is_income else "Добавить (расход)"
+        text, ok = QInputDialog.getText(self, title, "Комментарий:")
+        if not ok:
+            return
+        t = (text or "").strip()
+        if not t:
+            return
+        if t == OTHER_COMMENT_TEXT:
+            QMessageBox.warning(self, "Нельзя", f"«{OTHER_COMMENT_TEXT}» добавлять/удалять не нужно — он встроенный.")
             return
 
-        sid = int(active["id"])
-        inc, exp = self.db.sums_for_shift(sid)
-        profit = inc - exp
-        st = datetime.fromisoformat(str(active["started_at"]))
-        dur = int((now_local() - st).total_seconds())
+        lst = self.income_list if is_income else self.expense_list
+        for i in range(lst.count()):
+            if lst.item(i).text().strip().lower() == t.lower():
+                QMessageBox.warning(self, "Дубликат", "Такой комментарий уже существует.")
+                return
+        lst.addItem(t)
 
-        self.card_status.set_value(f"Активна • #{sid}", "Shift")
-        self.card_inc.set_value(fmt_money(inc))
-        self.card_exp.set_value(fmt_money(exp))
-        self.card_profit.set_value(fmt_money(profit))
-        self.card_time.set_value(fmt_duration(dur))
+    def _rename_comment(self, is_income: bool):
+        lst = self.income_list if is_income else self.expense_list
+        item = lst.currentItem()
+        if not item:
+            QMessageBox.warning(self, "Выбор", "Выберите комментарий.")
+            return
+        old = item.text()
+        if old == OTHER_COMMENT_TEXT:
+            QMessageBox.warning(self, "Нельзя", f"«{OTHER_COMMENT_TEXT}» нельзя переименовать.")
+            return
 
-        self.btn_start_shift.setEnabled(False)
-        self.btn_end_shift.setEnabled(True)
+        title = "Переименовать (доход)" if is_income else "Переименовать (расход)"
+        text, ok = QInputDialog.getText(self, title, "Новое название:", text=old)
+        if not ok:
+            return
+        t = (text or "").strip()
+        if not t:
+            return
+        if t == OTHER_COMMENT_TEXT:
+            QMessageBox.warning(self, "Нельзя", f"«{OTHER_COMMENT_TEXT}» — встроенный пункт.")
+            return
+        item.setText(t)
 
-        ops = self.db.list_ops_for_shift(sid)
-        self.ops_table.setRowCount(len(ops))
-        for i, r in enumerate(ops):
-            ts = datetime.fromisoformat(str(r["ts"])).strftime("%H:%M:%S")
-            kind = "Доход" if r["kind"] == "IN" else "Расход"
-            amt = fmt_money(float(r["amount"]))
-            com = str(r["comment"])
-            self.ops_table.setItem(i, 0, QtWidgets.QTableWidgetItem(ts))
-            self.ops_table.setItem(i, 1, QtWidgets.QTableWidgetItem(kind))
-            self.ops_table.setItem(i, 2, QtWidgets.QTableWidgetItem(amt))
-            self.ops_table.setItem(i, 3, QtWidgets.QTableWidgetItem(com))
-        self.ops_table.resizeColumnsToContents()
+    def _delete_comment(self, is_income: bool):
+        lst = self.income_list if is_income else self.expense_list
+        item = lst.currentItem()
+        if not item:
+            QMessageBox.warning(self, "Выбор", "Выберите комментарий.")
+            return
+        if item.text() == OTHER_COMMENT_TEXT:
+            QMessageBox.warning(self, "Нельзя", f"«{OTHER_COMMENT_TEXT}» нельзя удалить.")
+            return
 
-    # ------------------------- UX helpers -------------------------
+        ans = QMessageBox.question(
+            self, "Удаление", f"Удалить комментарий:\n\n{item.text()}",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if ans != QMessageBox.Yes:
+            return
+        lst.takeItem(lst.row(item))
 
-    def toast(self, msg: str, error: bool = False):
-        self.status.showMessage(msg, 3500)
-        if error:
-            QtWidgets.QApplication.beep()
+    def _reset_all(self):
+        ans = QMessageBox.question(
+            self,
+            "Полный сброс",
+            "Удалить ВСЮ историю смен и операций?\nЭто действие нельзя отменить.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
 
-    def closeEvent(self, e: QtGui.QCloseEvent):
-        try:
-            self.hotkeys.stop()
-        except Exception:
-            pass
-        super().closeEvent(e)
+        text, ok = QInputDialog.getText(self, "Подтверждение", "Введите слово: СБРОС")
+        if not ok:
+            return
+        if (text or "").strip().upper() != "СБРОС":
+            QMessageBox.warning(self, "Отменено", "Неверное подтверждение.")
+            return
+
+        self.storage.reset_all_history()
+        QMessageBox.information(self, "Готово", "История удалена.")
+        self.after_reset_cb()
 
 
-# ------------------------------- Entry -------------------------------
+# ---------------------------
+# Main window
+# ---------------------------
+
+class MainWindow(QMainWindow):
+    def __init__(self, storage: Storage):
+        super().__init__()
+        self.storage = storage
+
+        self.setWindowTitle("Калькулятор таксиста")
+        self.resize(1120, 720)
+
+        self.stack = QStackedWidget()
+        self.setCentralWidget(self.stack)
+
+        self.shift_page = ShiftPage(storage, open_history_cb=self.open_history, open_settings_cb=self.open_settings)
+        self.history_page = HistoryPage(storage, back_cb=self.open_shift)
+        self.settings_page = SettingsPage(
+            storage,
+            back_cb=self.open_shift,
+            apply_overlay_cb=self.apply_overlay_settings,
+            after_reset_cb=self._after_full_reset,
+        )
+
+        self.stack.addWidget(self.shift_page)
+        self.stack.addWidget(self.history_page)
+        self.stack.addWidget(self.settings_page)
+
+        self.open_shift()
+        self.apply_overlay_settings()
+
+    def open_shift(self):
+        self.stack.setCurrentWidget(self.shift_page)
+        self.shift_page._load_active_shift()
+        self.shift_page._refresh_comments_based_on_amount()
+        self.shift_page._refresh_all_time_bar()
+
+    def open_history(self):
+        self.history_page.refresh()
+        self.stack.setCurrentWidget(self.history_page)
+
+    def open_settings(self):
+        self.settings_page.refresh()
+        self.stack.setCurrentWidget(self.settings_page)
+
+    def apply_overlay_settings(self):
+        o = self.storage.get_overlay_settings()
+
+        flags = Qt.Window
+        if o["always_on_top"]:
+            flags |= Qt.WindowStaysOnTopHint
+        if o["frameless"]:
+            flags |= Qt.FramelessWindowHint
+
+        self.setWindowFlags(flags)
+        self.setWindowOpacity(max(0.30, min(1.0, o["opacity"] / 100.0)))
+        self.show()
+
+    def _after_full_reset(self):
+        self.open_shift()
+
+
+# ---------------------------
+# Entry
+# ---------------------------
 
 def main():
-    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
-    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+    app = QApplication([])
+    app.setStyleSheet(modern_stylesheet())
 
-    app = QtWidgets.QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
+    font = QFont("Segoe UI", 10)
+    app.setFont(font)
 
-    db = DB(DB_FILE)
-    w = MainWindow(db)
+    storage = Storage()
+    storage.load()
 
-    screen = app.primaryScreen().availableGeometry()
-    w.resize(1060, 680)
-    w.move(screen.center() - w.rect().center())
-
+    w = MainWindow(storage)
     w.show()
-    w.raise_()
-    w.activateWindow()
 
-    sys.exit(app.exec())
+    app.exec()
+
 
 if __name__ == "__main__":
     main()
