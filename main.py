@@ -13,11 +13,11 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 
-from PySide6.QtCore import Qt, QTimer, QStandardPaths, QRectF, Signal
+from PySide6.QtCore import Qt, QTimer, QStandardPaths, QRectF, Signal, QDate
 from PySide6.QtGui import QFont, QAction, QCursor, QPainter, QLinearGradient, QColor, QPen, QKeyEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QMenu,
     QScrollArea,
+    QDateEdit,
 )
 
 
@@ -173,6 +174,7 @@ def default_data() -> Dict[str, Any]:
             "overlay_always_on_top": True,
             "overlay_opacity": 95,
             "overlay_frameless": False,
+            "app_name": "Калькулятор таксиста",
         },
         "shifts": [],
         "active_shift_id": None,
@@ -205,6 +207,7 @@ class Storage:
         s.setdefault("overlay_always_on_top", True)
         s.setdefault("overlay_opacity", 95)
         s.setdefault("overlay_frameless", False)
+        s.setdefault("app_name", "Калькулятор таксиста")
         self.save()
         return self.data
 
@@ -318,6 +321,32 @@ class Storage:
         self.data["settings"]["overlay_opacity"] = int(opacity)
         self.data["settings"]["overlay_frameless"] = bool(frameless)
         self.save()
+
+    def get_app_name(self) -> str:
+        name = self.data["settings"].get("app_name", "").strip()
+        return name or "Калькулятор таксиста"
+
+    def set_app_name(self, name: str) -> None:
+        clean = (name or "").strip()
+        if not clean:
+            clean = "Калькулятор таксиста"
+        self.data["settings"]["app_name"] = clean
+        self.save()
+
+    def get_shift_numbers_map(self) -> Dict[str, int]:
+        mapping: Dict[str, int] = {}
+        for idx, s in enumerate(sorted(self.shifts(), key=lambda sh: sh.start_ts), start=1):
+            mapping[s.id] = idx
+        return mapping
+
+    def get_shift_number(self, shift_id: str) -> Optional[int]:
+        return self.get_shift_numbers_map().get(shift_id)
+
+    def get_shift_by_id(self, shift_id: str) -> Optional[Shift]:
+        for s in self.shifts():
+            if s.id == shift_id:
+                return s
+        return None
 
     def totals_all_time(self) -> Tuple[int, int, int]:
         inc = 0
@@ -638,7 +667,7 @@ class OperationItem(QWidget):
 class ShiftCard(QWidget):
     clicked = Signal(str)
 
-    def __init__(self, shift: Shift, parent=None):
+    def __init__(self, shift: Shift, number: Optional[int] = None, parent=None):
         super().__init__(parent)
         self.shift_id = shift.id
         self.setCursor(Qt.PointingHandCursor)
@@ -661,8 +690,12 @@ class ShiftCard(QWidget):
         layout.setSpacing(14)
         header = QHBoxLayout()
         start_dt = iso_to_dt(shift.start_ts)
+        label_text = "📅  "
+        if number is not None:
+            label_text += f"Смена №{number} • "
+        label_text += pretty_date(dt_to_ymd(start_dt))
         end_dt = iso_to_dt(shift.end_ts) if shift.end_ts else None
-        date_label = QLabel(f"📅  {pretty_date(dt_to_ymd(start_dt))}")
+        date_label = QLabel(label_text)
         date_label.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: 15px; font-weight: 700;")
         header.addWidget(date_label)
         header.addStretch()
@@ -794,6 +827,7 @@ class OperationDetailsDialog(QDialog):
         self.storage = storage
         self.shift = shift
         self.op = op
+        self.shift_number = self.storage.get_shift_number(self.shift.id)
         self.setWindowTitle("Детали операции")
         self.setModal(True)
         self.setMinimumSize(420, 320)
@@ -821,10 +855,13 @@ class OperationDetailsDialog(QDialog):
         info_layout.setContentsMargins(16, 16, 16, 16)
         info_layout.setSpacing(12)
         dt = iso_to_dt(self.op.ts)
+        shift_title = pretty_date(dt_to_ymd(iso_to_dt(self.shift.start_ts)))
+        if self.shift_number:
+            shift_title = f"Смена №{self.shift_number} — {shift_title}"
         fields = [
             ("📝", "Комментарий", self.op.comment),
             ("🕐", "Дата и время", dt_to_pretty(dt)),
-            ("📋", "Смена", pretty_date(dt_to_ymd(iso_to_dt(self.shift.start_ts)))),
+            ("📋", "Смена", shift_title),
         ]
         for icon, label, value in fields:
             row = QHBoxLayout()
@@ -858,74 +895,113 @@ class OperationDetailsDialog(QDialog):
 
 
 class ShiftDetailsDialog(QDialog):
-    def __init__(self, parent: QWidget, shift: Shift):
+    def __init__(self, parent: QWidget, storage: Storage, shift: Shift, shift_number: Optional[int] = None):
         super().__init__(parent)
+        self.storage = storage
         self.shift = shift
+        self.shift_number = shift_number or self.storage.get_shift_number(shift.id)
         self.setWindowTitle("Детали смены")
         self.setModal(True)
         self.setMinimumSize(600, 500)
         self.resize(700, 600)
         self._setup_ui()
+        self._render_shift()
+        self._render_operations()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(20)
-        start_dt = iso_to_dt(self.shift.start_ts)
-        end_dt = iso_to_dt(self.shift.end_ts) if self.shift.end_ts else None
         header = QHBoxLayout()
-        title = QLabel(f"🚕  Смена {pretty_date(dt_to_ymd(start_dt))}")
-        title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: 22px; font-weight: 800;")
-        header.addWidget(title)
+        self.title_label = QLabel()
+        self.title_label.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: 22px; font-weight: 800;")
+        header.addWidget(self.title_label)
         header.addStretch()
-        if end_dt is None:
-            status = QLabel("● Активна")
-            status.setStyleSheet(f"background: {Colors.SUCCESS_BG}; border: 1px solid {Colors.SUCCESS_BORDER}; border-radius: 10px; padding: 6px 12px; color: {Colors.SUCCESS}; font-size: 12px; font-weight: 700;")
-        else:
-            status = QLabel("Завершена")
-            status.setStyleSheet(f"background: {Colors.BG_CARD}; border: 1px solid {Colors.BORDER}; border-radius: 10px; padding: 6px 12px; color: {Colors.TEXT_MUTED}; font-size: 12px; font-weight: 700;")
-        header.addWidget(status)
+        self.status_label = QLabel()
+        header.addWidget(self.status_label)
         layout.addLayout(header)
-        time_text = f"{dt_to_time(start_dt)} — {dt_to_time(end_dt) if end_dt else 'сейчас'}"
-        time_label = QLabel(f"⏰  {time_text}")
-        time_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: 14px; font-weight: 600;")
-        layout.addWidget(time_label)
+        self.time_label = QLabel()
+        self.time_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: 14px; font-weight: 600;")
+        layout.addWidget(self.time_label)
         metrics = QHBoxLayout()
         metrics.setSpacing(16)
-        income_card = MetricCard("📈", "Доход", f"+{format_money(self.shift.income())}", Colors.SUCCESS)
-        metrics.addWidget(income_card)
-        expense_card = MetricCard("📉", "Расход", f"−{format_money(self.shift.expense())}", Colors.DANGER)
-        metrics.addWidget(expense_card)
-        total = self.shift.total()
-        sign = "+" if total >= 0 else ""
-        total_card = MetricCard("💰", "Итог", f"{sign}{format_money(total)}", Colors.amount_color(total))
-        metrics.addWidget(total_card)
+        self.income_card = MetricCard("📈", "Доход", "+0", Colors.SUCCESS)
+        metrics.addWidget(self.income_card)
+        self.expense_card = MetricCard("📉", "Расход", "−0", Colors.DANGER)
+        metrics.addWidget(self.expense_card)
+        self.total_card = MetricCard("💰", "Итог", "0", Colors.TEXT_PRIMARY)
+        metrics.addWidget(self.total_card)
         layout.addLayout(metrics)
-        ops_label = QLabel(f"Операции ({len(self.shift.operations)})")
-        ops_label.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: 16px; font-weight: 700;")
-        layout.addWidget(ops_label)
+        self.ops_label = QLabel()
+        self.ops_label.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: 16px; font-weight: 700;")
+        layout.addWidget(self.ops_label)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll_content = QWidget()
-        scroll_layout = QVBoxLayout(scroll_content)
-        scroll_layout.setContentsMargins(0, 0, 8, 0)
-        scroll_layout.setSpacing(8)
-        for op in reversed(self.shift.operations):
-            dt = iso_to_dt(op.ts)
-            card = OperationItem(op.id, dt_to_time(dt), op.comment, op.amount)
-            scroll_layout.addWidget(card)
-        if not self.shift.operations:
-            empty = QLabel("Нет операций")
-            empty.setAlignment(Qt.AlignCenter)
-            empty.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 14px; padding: 30px;")
-            scroll_layout.addWidget(empty)
-        scroll_layout.addStretch()
-        scroll.setWidget(scroll_content)
+        self.ops_container = QWidget()
+        self.ops_layout = QVBoxLayout(self.ops_container)
+        self.ops_layout.setContentsMargins(0, 0, 8, 0)
+        self.ops_layout.setSpacing(8)
+        self.ops_layout.addStretch()
+        scroll.setWidget(self.ops_container)
         layout.addWidget(scroll)
         btn_close = ShimmerButton("Закрыть", kind="neutral")
         btn_close.clicked.connect(self.accept)
         layout.addWidget(btn_close, alignment=Qt.AlignRight)
+
+    def _render_shift(self):
+        start_dt = iso_to_dt(self.shift.start_ts)
+        end_dt = iso_to_dt(self.shift.end_ts) if self.shift.end_ts else None
+        title_text = f"🚕  "
+        if self.shift_number:
+            title_text += f"Смена №{self.shift_number} — "
+        title_text += pretty_date(dt_to_ymd(start_dt))
+        self.title_label.setText(title_text)
+        if end_dt is None:
+            self.status_label.setText("● Активна")
+            self.status_label.setStyleSheet(f"background: {Colors.SUCCESS_BG}; border: 1px solid {Colors.SUCCESS_BORDER}; border-radius: 10px; padding: 6px 12px; color: {Colors.SUCCESS}; font-size: 12px; font-weight: 700;")
+        else:
+            self.status_label.setText("Завершена")
+            self.status_label.setStyleSheet(f"background: {Colors.BG_CARD}; border: 1px solid {Colors.BORDER}; border-radius: 10px; padding: 6px 12px; color: {Colors.TEXT_MUTED}; font-size: 12px; font-weight: 700;")
+        time_text = f"{dt_to_time(start_dt)} — {dt_to_time(end_dt) if end_dt else 'сейчас'}"
+        self.time_label.setText(f"⏰  {time_text}")
+        self.income_card.set_value(f"+{format_money(self.shift.income())}", Colors.SUCCESS)
+        self.expense_card.set_value(f"−{format_money(self.shift.expense())}", Colors.DANGER)
+        total = self.shift.total()
+        sign = "+" if total >= 0 else ""
+        self.total_card.set_value(f"{sign}{format_money(total)}", Colors.amount_color(total))
+        self.ops_label.setText(f"Операции ({len(self.shift.operations)})")
+
+    def _render_operations(self):
+        while self.ops_layout.count() > 1:
+            item = self.ops_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        if not self.shift.operations:
+            empty = QLabel("Нет операций")
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 14px; padding: 30px;")
+            self.ops_layout.insertWidget(0, empty)
+            return
+        for op in reversed(self.shift.operations):
+            dt = iso_to_dt(op.ts)
+            card = OperationItem(op.id, dt_to_time(dt), op.comment, op.amount)
+            card.clicked.connect(lambda _=False, oid=op.id: self._open_operation(oid))
+            self.ops_layout.insertWidget(self.ops_layout.count() - 1, card)
+
+    def _open_operation(self, op_id: str):
+        found = self.storage.find_operation(op_id)
+        if not found:
+            return
+        shift, op = found
+        dlg = OperationDetailsDialog(self, self.storage, shift, op)
+        dlg.exec()
+        updated_shift = self.storage.get_shift_by_id(self.shift.id)
+        if updated_shift:
+            self.shift = updated_shift
+            self.shift_number = self.shift_number or self.storage.get_shift_number(self.shift.id)
+            self._render_shift()
+            self._render_operations()
 
 
 class DayDetailsDialog(QDialog):
@@ -933,6 +1009,7 @@ class DayDetailsDialog(QDialog):
         super().__init__(parent)
         self.storage = storage
         self.ymd = ymd
+        self.shift_numbers = self.storage.get_shift_numbers_map()
         self.setWindowTitle("Детали дня")
         self.setModal(True)
         self.setMinimumSize(650, 550)
@@ -978,7 +1055,7 @@ class DayDetailsDialog(QDialog):
         scroll_layout.setContentsMargins(0, 0, 8, 0)
         scroll_layout.setSpacing(12)
         for shift in shifts:
-            card = ShiftCard(shift)
+            card = ShiftCard(shift, number=self.shift_numbers.get(shift.id))
             card.clicked.connect(self._open_shift)
             scroll_layout.addWidget(card)
         scroll_layout.addStretch()
@@ -991,7 +1068,7 @@ class DayDetailsDialog(QDialog):
     def _open_shift(self, shift_id: str):
         for s in self.storage.shifts():
             if s.id == shift_id:
-                ShiftDetailsDialog(self, s).exec()
+                ShiftDetailsDialog(self, self.storage, s, self.shift_numbers.get(s.id)).exec()
                 return
 
 
@@ -1003,6 +1080,7 @@ class ShiftPage(QWidget):
         self.open_settings_cb = open_settings_cb
         self._build_ui()
         self._load_active_shift()
+        self.set_app_name(self.storage.get_app_name())
 
     def _build_ui(self):
         scroll = QScrollArea()
@@ -1019,9 +1097,9 @@ class ShiftPage(QWidget):
         header = QHBoxLayout()
         title_box = QVBoxLayout()
         title_box.setSpacing(6)
-        title = QLabel("🚕  Калькулятор таксиста")
-        title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: 24px; font-weight: 900;")
-        title_box.addWidget(title)
+        self.title = QLabel()
+        self.title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: 24px; font-weight: 900;")
+        title_box.addWidget(self.title)
         subtitle = QLabel("Профессиональный учёт доходов и расходов")
         subtitle.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: 13px; font-weight: 600;")
         title_box.addWidget(subtitle)
@@ -1126,6 +1204,9 @@ class ShiftPage(QWidget):
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.addWidget(scroll)
+
+    def set_app_name(self, name: str):
+        self.title.setText(f"🚕  {name}")
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
@@ -1300,6 +1381,7 @@ class HistoryPage(QWidget):
         self.storage = storage
         self.back_cb = back_cb
         self.current_view = "shifts"
+        self.shift_numbers: Dict[str, int] = {}
         self._build_ui()
 
     def _build_ui(self):
@@ -1338,6 +1420,39 @@ class HistoryPage(QWidget):
         view_switch.addWidget(self.btn_days)
         view_switch.addStretch()
         layout.addLayout(view_switch)
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(10)
+        filter_label = QLabel("Фильтр по дате:")
+        filter_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: 13px; font-weight: 600;")
+        filter_row.addWidget(filter_label)
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItem("Все время", "all")
+        self.filter_combo.addItem("Сегодня", "today")
+        self.filter_combo.addItem("Вчера", "yesterday")
+        self.filter_combo.addItem("Последние 7 дней", "week")
+        self.filter_combo.addItem("Этот месяц", "month")
+        self.filter_combo.addItem("Произвольный период", "custom")
+        self.filter_combo.currentIndexChanged.connect(self._on_filter_change)
+        filter_row.addWidget(self.filter_combo)
+        self.start_date = QDateEdit()
+        self.start_date.setCalendarPopup(True)
+        self.start_date.setDisplayFormat("dd.MM.yyyy")
+        self.start_date.setDate(QDate.currentDate())
+        self.start_date.setEnabled(False)
+        self.start_date.dateChanged.connect(self.refresh)
+        filter_row.addWidget(self.start_date)
+        to_label = QLabel("—")
+        to_label.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 14px;")
+        filter_row.addWidget(to_label)
+        self.end_date = QDateEdit()
+        self.end_date.setCalendarPopup(True)
+        self.end_date.setDisplayFormat("dd.MM.yyyy")
+        self.end_date.setDate(QDate.currentDate())
+        self.end_date.setEnabled(False)
+        self.end_date.dateChanged.connect(self.refresh)
+        filter_row.addWidget(self.end_date)
+        filter_row.addStretch()
+        layout.addLayout(filter_row)
         self.content_stack = QStackedWidget()
         self.shifts_widget = QWidget()
         shifts_layout = QVBoxLayout(self.shifts_widget)
@@ -1374,6 +1489,56 @@ class HistoryPage(QWidget):
         self.btn_shifts.update()
         self.btn_days.update()
 
+    def _on_filter_change(self):
+        is_custom = self.filter_combo.currentData() == "custom"
+        self.start_date.setEnabled(is_custom)
+        self.end_date.setEnabled(is_custom)
+        self.refresh()
+
+    @staticmethod
+    def _qdate_to_date(d: QDate) -> date:
+        return date(d.year(), d.month(), d.day())
+
+    def _current_range(self) -> Tuple[Optional[date], Optional[date]]:
+        mode = self.filter_combo.currentData()
+        today = date.today()
+        if mode == "today":
+            return today, today
+        if mode == "yesterday":
+            y = date.fromordinal(today.toordinal() - 1)
+            return y, y
+        if mode == "week":
+            start = date.fromordinal(today.toordinal() - 6)
+            return start, today
+        if mode == "month":
+            start = date(today.year, today.month, 1)
+            return start, today
+        if mode == "custom":
+            start = self._qdate_to_date(self.start_date.date())
+            end = self._qdate_to_date(self.end_date.date())
+            if end < start:
+                start, end = end, start
+                self.start_date.blockSignals(True)
+                self.end_date.blockSignals(True)
+                self.start_date.setDate(QDate(start.year, start.month, start.day))
+                self.end_date.setDate(QDate(end.year, end.month, end.day))
+                self.start_date.blockSignals(False)
+                self.end_date.blockSignals(False)
+            return start, end
+        return None, None
+
+    def _get_filtered_shifts(self) -> List[Shift]:
+        start, end = self._current_range()
+        shifts = sorted(self.storage.shifts(), key=lambda s: s.start_ts, reverse=True)
+        if not start or not end:
+            return shifts
+        filtered: List[Shift] = []
+        for s in shifts:
+            d = iso_to_dt(s.start_ts).date()
+            if start <= d <= end:
+                filtered.append(s)
+        return filtered
+
     def refresh(self):
         while self.shifts_container.count():
             item = self.shifts_container.takeAt(0)
@@ -1383,7 +1548,9 @@ class HistoryPage(QWidget):
             item = self.days_container.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        shifts = sorted(self.storage.shifts(), key=lambda s: s.start_ts, reverse=True)
+        shifts = self._get_filtered_shifts()
+        numbers = self.storage.get_shift_numbers_map()
+        self.shift_numbers = numbers
         if not shifts:
             empty = QLabel("История пуста")
             empty.setAlignment(Qt.AlignCenter)
@@ -1391,7 +1558,7 @@ class HistoryPage(QWidget):
             self.shifts_container.addWidget(empty)
         else:
             for shift in shifts[:50]:
-                card = ShiftCard(shift)
+                card = ShiftCard(shift, number=numbers.get(shift.id))
                 card.clicked.connect(self._open_shift)
                 self.shifts_container.addWidget(card)
         day_map: Dict[str, Dict] = {}
@@ -1418,7 +1585,7 @@ class HistoryPage(QWidget):
     def _open_shift(self, shift_id: str):
         for s in self.storage.shifts():
             if s.id == shift_id:
-                ShiftDetailsDialog(self, s).exec()
+                ShiftDetailsDialog(self, self.storage, s, self.shift_numbers.get(s.id)).exec()
                 return
 
     def _open_day(self, ymd: str):
@@ -1426,12 +1593,13 @@ class HistoryPage(QWidget):
 
 
 class SettingsPage(QWidget):
-    def __init__(self, storage: Storage, back_cb, apply_overlay_cb, after_reset_cb):
+    def __init__(self, storage: Storage, back_cb, apply_overlay_cb, after_reset_cb, app_name_changed_cb):
         super().__init__()
         self.storage = storage
         self.back_cb = back_cb
         self.apply_overlay_cb = apply_overlay_cb
         self.after_reset_cb = after_reset_cb
+        self.app_name_changed_cb = app_name_changed_cb
         self._build_ui()
 
     def _build_ui(self):
@@ -1458,6 +1626,20 @@ class SettingsPage(QWidget):
         btn_save.clicked.connect(self._save)
         header.addWidget(btn_save)
         layout.addLayout(header)
+        app_name_card = GlassCard()
+        app_name_layout = QVBoxLayout(app_name_card)
+        app_name_layout.setContentsMargins(20, 20, 20, 20)
+        app_name_layout.setSpacing(12)
+        app_name_title = QLabel("🏷  Название приложения")
+        app_name_title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: 16px; font-weight: 700;")
+        app_name_layout.addWidget(app_name_title)
+        app_name_hint = QLabel("Это название будет показано на главном экране и в заголовке окна.")
+        app_name_hint.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: 12px;")
+        app_name_layout.addWidget(app_name_hint)
+        self.app_name_edit = QLineEdit()
+        self.app_name_edit.setPlaceholderText("Например: Учёт смен TaxiPro")
+        app_name_layout.addWidget(self.app_name_edit)
+        layout.addWidget(app_name_card)
         comments_card = GlassCard()
         comments_layout = QVBoxLayout(comments_card)
         comments_layout.setContentsMargins(20, 20, 20, 20)
@@ -1593,6 +1775,7 @@ class SettingsPage(QWidget):
         main_layout.addWidget(scroll)
 
     def refresh(self):
+        self.app_name_edit.setText(self.storage.get_app_name())
         comm = self.storage.get_comments()
         self.income_list.clear()
         for c in comm.get("income", []):
@@ -1606,6 +1789,7 @@ class SettingsPage(QWidget):
         self.spn_opacity.setValue(o["opacity"])
 
     def _save(self):
+        self.storage.set_app_name(self.app_name_edit.text())
         income = [self.income_list.item(i).text().strip() for i in range(self.income_list.count())]
         expense = [self.expense_list.item(i).text().strip() for i in range(self.expense_list.count())]
         income = [x for x in income if x]
@@ -1620,6 +1804,8 @@ class SettingsPage(QWidget):
             opacity=self.spn_opacity.value(),
             frameless=self.chk_frameless.isChecked()
         )
+        if self.app_name_changed_cb:
+            self.app_name_changed_cb(self.storage.get_app_name())
         self.apply_overlay_cb()
         QMessageBox.information(self, "Сохранено", "Настройки успешно сохранены.")
 
@@ -1664,14 +1850,20 @@ class MainWindow(QMainWindow):
     def __init__(self, storage: Storage):
         super().__init__()
         self.storage = storage
-        self.setWindowTitle("Калькулятор таксиста")
+        self.setWindowTitle(self.storage.get_app_name())
         self.setMinimumSize(900, 650)
         self.resize(1100, 750)
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
         self.shift_page = ShiftPage(storage, open_history_cb=self.open_history, open_settings_cb=self.open_settings)
         self.history_page = HistoryPage(storage, back_cb=self.open_shift)
-        self.settings_page = SettingsPage(storage, back_cb=self.open_shift, apply_overlay_cb=self.apply_overlay_settings, after_reset_cb=self.open_shift)
+        self.settings_page = SettingsPage(
+            storage,
+            back_cb=self.open_shift,
+            apply_overlay_cb=self.apply_overlay_settings,
+            after_reset_cb=self.open_shift,
+            app_name_changed_cb=self._on_app_name_changed
+        )
         self.stack.addWidget(self.shift_page)
         self.stack.addWidget(self.history_page)
         self.stack.addWidget(self.settings_page)
@@ -1701,6 +1893,11 @@ class MainWindow(QMainWindow):
         self.setWindowOpacity(max(0.3, min(1.0, o["opacity"] / 100.0)))
         self.show()
 
+    def _on_app_name_changed(self, name: str):
+        clean = name or self.storage.get_app_name()
+        self.setWindowTitle(clean)
+        self.shift_page.set_app_name(clean)
+
 
 def main():
     app = QApplication([])
@@ -1717,4 +1914,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
