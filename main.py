@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 
 from PySide6.QtCore import Qt, QTimer, QStandardPaths, QRectF, Signal, QDate
-from PySide6.QtGui import QFont, QAction, QCursor, QPainter, QLinearGradient, QColor, QPen, QKeyEvent
+from PySide6.QtGui import QFont, QAction, QCursor, QPainter, QLinearGradient, QColor, QPen, QKeyEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -40,12 +40,14 @@ from PySide6.QtWidgets import (
     QMenu,
     QScrollArea,
     QDateEdit,
+    QKeySequenceEdit,
 )
 
 
 APP_NAME = "TaxiCalculatorPremium"
 DATA_FILE = "taxi_calculator_data.json"
 OTHER_COMMENT_TEXT = "Другое (ввести вручную)"
+DEFAULT_TOGGLE_HOTKEY = "Ctrl+Shift+M"
 
 
 def now_iso() -> str:
@@ -78,6 +80,10 @@ def dt_to_time(dt: datetime) -> str:
 
 def format_money(n: int) -> str:
     return f"{n:,}".replace(",", " ")
+
+
+def format_currency(n: int) -> str:
+    return f"{format_money(n)} $"
 
 
 def parse_amount(text: str) -> Optional[int]:
@@ -175,6 +181,7 @@ def default_data() -> Dict[str, Any]:
             "overlay_opacity": 95,
             "overlay_frameless": False,
             "app_name": "Калькулятор таксиста",
+            "toggle_hotkey": DEFAULT_TOGGLE_HOTKEY,
         },
         "shifts": [],
         "active_shift_id": None,
@@ -207,6 +214,7 @@ class Storage:
         s.setdefault("overlay_always_on_top", True)
         s.setdefault("overlay_opacity", 95)
         s.setdefault("overlay_frameless", False)
+        s.setdefault("toggle_hotkey", DEFAULT_TOGGLE_HOTKEY)
         s.setdefault("app_name", "Калькулятор таксиста")
         self.save()
         return self.data
@@ -320,6 +328,13 @@ class Storage:
         self.data["settings"]["overlay_always_on_top"] = bool(always_on_top)
         self.data["settings"]["overlay_opacity"] = int(opacity)
         self.data["settings"]["overlay_frameless"] = bool(frameless)
+        self.save()
+
+    def get_toggle_hotkey(self) -> str:
+        return str(self.data["settings"].get("toggle_hotkey", DEFAULT_TOGGLE_HOTKEY))
+
+    def set_toggle_hotkey(self, hotkey: str) -> None:
+        self.data["settings"]["toggle_hotkey"] = str(hotkey or "").strip()
         self.save()
 
     def get_app_name(self) -> str:
@@ -654,7 +669,7 @@ class OperationItem(QWidget):
         info.addWidget(time_label)
         layout.addLayout(info, 1)
         sign = "+" if amount >= 0 else ""
-        amount_label = QLabel(f"{sign}{format_money(amount)}")
+        amount_label = QLabel(f"{sign}{format_currency(amount)}")
         amount_label.setStyleSheet(f"color: {color}; font-size: 15px; font-weight: 800;")
         layout.addWidget(amount_label)
 
@@ -714,7 +729,7 @@ class ShiftCard(QWidget):
         inc_title = QLabel("Доход")
         inc_title.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 11px; font-weight: 600;")
         inc_box.addWidget(inc_title)
-        inc_value = QLabel(f"+{format_money(shift.income())}")
+        inc_value = QLabel(f"+{format_currency(shift.income())}")
         inc_value.setStyleSheet(f"color: {Colors.SUCCESS}; font-size: 16px; font-weight: 800;")
         inc_box.addWidget(inc_value)
         metrics.addLayout(inc_box)
@@ -723,7 +738,7 @@ class ShiftCard(QWidget):
         exp_title = QLabel("Расход")
         exp_title.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 11px; font-weight: 600;")
         exp_box.addWidget(exp_title)
-        exp_value = QLabel(f"−{format_money(shift.expense())}")
+        exp_value = QLabel(f"−{format_currency(shift.expense())}")
         exp_value.setStyleSheet(f"color: {Colors.DANGER}; font-size: 16px; font-weight: 800;")
         exp_box.addWidget(exp_value)
         metrics.addLayout(exp_box)
@@ -734,7 +749,7 @@ class ShiftCard(QWidget):
         total_title.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 11px; font-weight: 600;")
         total_box.addWidget(total_title, alignment=Qt.AlignRight)
         sign = "+" if total >= 0 else ""
-        total_value = QLabel(f"{sign}{format_money(total)}")
+        total_value = QLabel(f"{sign}{format_currency(total)}")
         total_value.setStyleSheet(f"color: {color}; font-size: 20px; font-weight: 900;")
         total_box.addWidget(total_value, alignment=Qt.AlignRight)
         metrics.addLayout(total_box)
@@ -789,7 +804,7 @@ class DayCard(QWidget):
         inc_title = QLabel("Доход")
         inc_title.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 11px; font-weight: 600;")
         inc_box.addWidget(inc_title)
-        inc_value = QLabel(f"+{format_money(income)}")
+        inc_value = QLabel(f"+{format_currency(income)}")
         inc_value.setStyleSheet(f"color: {Colors.SUCCESS}; font-size: 18px; font-weight: 800;")
         inc_box.addWidget(inc_value)
         metrics.addLayout(inc_box)
@@ -798,7 +813,7 @@ class DayCard(QWidget):
         exp_title = QLabel("Расход")
         exp_title.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 11px; font-weight: 600;")
         exp_box.addWidget(exp_title)
-        exp_value = QLabel(f"−{format_money(expense)}")
+        exp_value = QLabel(f"−{format_currency(expense)}")
         exp_value.setStyleSheet(f"color: {Colors.DANGER}; font-size: 18px; font-weight: 800;")
         exp_box.addWidget(exp_value)
         metrics.addLayout(exp_box)
@@ -809,7 +824,7 @@ class DayCard(QWidget):
         total_title.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 11px; font-weight: 600;")
         total_box.addWidget(total_title, alignment=Qt.AlignRight)
         sign = "+" if total >= 0 else ""
-        total_value = QLabel(f"{sign}{format_money(total)}")
+        total_value = QLabel(f"{sign}{format_currency(total)}")
         total_value.setStyleSheet(f"color: {color}; font-size: 22px; font-weight: 900;")
         total_box.addWidget(total_value, alignment=Qt.AlignRight)
         metrics.addLayout(total_box)
@@ -846,7 +861,7 @@ class OperationDetailsDialog(QDialog):
         header.addWidget(title)
         header.addStretch()
         sign = "+" if self.op.amount >= 0 else ""
-        amount = QLabel(f"{sign}{format_money(self.op.amount)}")
+        amount = QLabel(f"{sign}{format_currency(self.op.amount)}")
         amount.setStyleSheet(f"color: {color}; font-size: 24px; font-weight: 900;")
         header.addWidget(amount)
         layout.addLayout(header)
@@ -965,11 +980,11 @@ class ShiftDetailsDialog(QDialog):
             self.status_label.setStyleSheet(f"background: {Colors.BG_CARD}; border: 1px solid {Colors.BORDER}; border-radius: 10px; padding: 6px 12px; color: {Colors.TEXT_MUTED}; font-size: 12px; font-weight: 700;")
         time_text = f"{dt_to_time(start_dt)} — {dt_to_time(end_dt) if end_dt else 'сейчас'}"
         self.time_label.setText(f"⏰  {time_text}")
-        self.income_card.set_value(f"+{format_money(self.shift.income())}", Colors.SUCCESS)
-        self.expense_card.set_value(f"−{format_money(self.shift.expense())}", Colors.DANGER)
+        self.income_card.set_value(f"+{format_currency(self.shift.income())}", Colors.SUCCESS)
+        self.expense_card.set_value(f"−{format_currency(self.shift.expense())}", Colors.DANGER)
         total = self.shift.total()
         sign = "+" if total >= 0 else ""
-        self.total_card.set_value(f"{sign}{format_money(total)}", Colors.amount_color(total))
+        self.total_card.set_value(f"{sign}{format_currency(total)}", Colors.amount_color(total))
         self.ops_label.setText(f"Операции ({len(self.shift.operations)})")
 
     def _render_operations(self):
@@ -1036,12 +1051,12 @@ class DayDetailsDialog(QDialog):
         layout.addLayout(header)
         metrics = QHBoxLayout()
         metrics.setSpacing(16)
-        income_card = MetricCard("📈", "Доход за день", f"+{format_money(day_income)}", Colors.SUCCESS)
+        income_card = MetricCard("📈", "Доход за день", f"+{format_currency(day_income)}", Colors.SUCCESS)
         metrics.addWidget(income_card)
-        expense_card = MetricCard("📉", "Расход за день", f"−{format_money(day_expense)}", Colors.DANGER)
+        expense_card = MetricCard("📉", "Расход за день", f"−{format_currency(day_expense)}", Colors.DANGER)
         metrics.addWidget(expense_card)
         sign = "+" if day_total >= 0 else ""
-        total_card = MetricCard("💰", "Итог дня", f"{sign}{format_money(day_total)}", Colors.amount_color(day_total))
+        total_card = MetricCard("💰", "Итог дня", f"{sign}{format_currency(day_total)}", Colors.amount_color(day_total))
         metrics.addWidget(total_card)
         layout.addLayout(metrics)
         shifts_label = QLabel("Смены")
@@ -1239,10 +1254,10 @@ class ShiftPage(QWidget):
         income = s.income()
         expense = s.expense()
         total = s.total()
-        self.income_metric.set_value(f"+{format_money(income)}", Colors.SUCCESS)
-        self.expense_metric.set_value(f"−{format_money(expense)}", Colors.DANGER)
+        self.income_metric.set_value(f"+{format_currency(income)}", Colors.SUCCESS)
+        self.expense_metric.set_value(f"−{format_currency(expense)}", Colors.DANGER)
         sign = "+" if total >= 0 else ""
-        self.total_metric.set_value(f"{sign}{format_money(total)}", Colors.amount_color(total))
+        self.total_metric.set_value(f"{sign}{format_currency(total)}", Colors.amount_color(total))
         while self.ops_layout.count() > 1:
             item = self.ops_layout.takeAt(0)
             if item.widget():
@@ -1263,10 +1278,10 @@ class ShiftPage(QWidget):
 
     def _update_all_time(self):
         inc, exp, net = self.storage.totals_all_time()
-        self.all_income.setText(f"Доход: +{format_money(inc)}")
-        self.all_expense.setText(f"Расход: −{format_money(exp)}")
+        self.all_income.setText(f"Доход: +{format_currency(inc)}")
+        self.all_expense.setText(f"Расход: −{format_currency(exp)}")
         sign = "+" if net >= 0 else ""
-        self.all_total.setText(f"Чистая прибыль: {sign}{format_money(net)}")
+        self.all_total.setText(f"Чистая прибыль: {sign}{format_currency(net)}")
         self.all_total.setStyleSheet(f"color: {Colors.amount_color(net)}; font-size: 16px; font-weight: 900;")
 
     def _on_amount_changed(self):
@@ -1381,6 +1396,7 @@ class HistoryPage(QWidget):
         self.storage = storage
         self.back_cb = back_cb
         self.current_view = "shifts"
+        self.filter_mode = "all"
         self.shift_numbers: Dict[str, int] = {}
         self._build_ui()
 
@@ -1420,39 +1436,63 @@ class HistoryPage(QWidget):
         view_switch.addWidget(self.btn_days)
         view_switch.addStretch()
         layout.addLayout(view_switch)
-        filter_row = QHBoxLayout()
-        filter_row.setSpacing(10)
-        filter_label = QLabel("Фильтр по дате:")
-        filter_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: 13px; font-weight: 600;")
-        filter_row.addWidget(filter_label)
-        self.filter_combo = QComboBox()
-        self.filter_combo.addItem("Все время", "all")
-        self.filter_combo.addItem("Сегодня", "today")
-        self.filter_combo.addItem("Вчера", "yesterday")
-        self.filter_combo.addItem("Последние 7 дней", "week")
-        self.filter_combo.addItem("Этот месяц", "month")
-        self.filter_combo.addItem("Произвольный период", "custom")
-        self.filter_combo.currentIndexChanged.connect(self._on_filter_change)
-        filter_row.addWidget(self.filter_combo)
+        filter_card = GlassCard()
+        filter_layout = QVBoxLayout(filter_card)
+        filter_layout.setContentsMargins(20, 18, 20, 18)
+        filter_layout.setSpacing(12)
+        filter_title = QLabel("Период истории")
+        filter_title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: 16px; font-weight: 700;")
+        filter_layout.addWidget(filter_title)
+        self.filter_buttons: Dict[str, ShimmerButton] = {}
+        filter_buttons_row = QHBoxLayout()
+        filter_buttons_row.setSpacing(8)
+        for mode, label in [
+            ("all", "Все время"),
+            ("today", "Сегодня"),
+            ("yesterday", "Вчера"),
+            ("week", "7 дней"),
+            ("month", "Месяц"),
+            ("custom", "Произвольный"),
+        ]:
+            btn = ShimmerButton(label, kind="neutral")
+            btn.setFixedHeight(32)
+            btn.clicked.connect(lambda checked=False, m=mode: self._set_filter_mode(m))
+            self.filter_buttons[mode] = btn
+            filter_buttons_row.addWidget(btn)
+        filter_buttons_row.addStretch()
+        filter_layout.addLayout(filter_buttons_row)
+        filter_range_row = QHBoxLayout()
+        filter_range_row.setSpacing(10)
+        range_label = QLabel("Диапазон:")
+        range_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: 13px; font-weight: 600;")
+        filter_range_row.addWidget(range_label)
         self.start_date = QDateEdit()
         self.start_date.setCalendarPopup(True)
         self.start_date.setDisplayFormat("dd.MM.yyyy")
         self.start_date.setDate(QDate.currentDate())
         self.start_date.setEnabled(False)
-        self.start_date.dateChanged.connect(self.refresh)
-        filter_row.addWidget(self.start_date)
+        filter_range_row.addWidget(self.start_date)
         to_label = QLabel("—")
         to_label.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 14px;")
-        filter_row.addWidget(to_label)
+        filter_range_row.addWidget(to_label)
         self.end_date = QDateEdit()
         self.end_date.setCalendarPopup(True)
         self.end_date.setDisplayFormat("dd.MM.yyyy")
         self.end_date.setDate(QDate.currentDate())
         self.end_date.setEnabled(False)
-        self.end_date.dateChanged.connect(self.refresh)
-        filter_row.addWidget(self.end_date)
-        filter_row.addStretch()
-        layout.addLayout(filter_row)
+        filter_range_row.addWidget(self.end_date)
+        self.btn_apply_filter = ShimmerButton("Применить", kind="primary")
+        self.btn_apply_filter.setFixedHeight(32)
+        self.btn_apply_filter.clicked.connect(self.refresh)
+        self.btn_apply_filter.setEnabled(False)
+        filter_range_row.addWidget(self.btn_apply_filter)
+        self.btn_reset_filter = ShimmerButton("Сброс", kind="neutral")
+        self.btn_reset_filter.setFixedHeight(32)
+        self.btn_reset_filter.clicked.connect(lambda: self._set_filter_mode("all"))
+        filter_range_row.addWidget(self.btn_reset_filter)
+        filter_range_row.addStretch()
+        filter_layout.addLayout(filter_range_row)
+        layout.addWidget(filter_card)
         self.content_stack = QStackedWidget()
         self.shifts_widget = QWidget()
         shifts_layout = QVBoxLayout(self.shifts_widget)
@@ -1473,6 +1513,7 @@ class HistoryPage(QWidget):
         self.content_stack.addWidget(self.shifts_widget)
         self.content_stack.addWidget(self.days_widget)
         layout.addWidget(self.content_stack)
+        self._set_filter_mode(self.filter_mode)
         scroll.setWidget(main_widget)
         main_layout.addWidget(scroll)
 
@@ -1489,18 +1530,24 @@ class HistoryPage(QWidget):
         self.btn_shifts.update()
         self.btn_days.update()
 
-    def _on_filter_change(self):
-        is_custom = self.filter_combo.currentData() == "custom"
+    def _set_filter_mode(self, mode: str):
+        self.filter_mode = mode
+        is_custom = mode == "custom"
         self.start_date.setEnabled(is_custom)
         self.end_date.setEnabled(is_custom)
-        self.refresh()
+        self.btn_apply_filter.setEnabled(is_custom)
+        for key, btn in self.filter_buttons.items():
+            btn.kind = "primary" if key == mode else "neutral"
+            btn.update()
+        if not is_custom:
+            self.refresh()
 
     @staticmethod
     def _qdate_to_date(d: QDate) -> date:
         return date(d.year(), d.month(), d.day())
 
     def _current_range(self) -> Tuple[Optional[date], Optional[date]]:
-        mode = self.filter_combo.currentData()
+        mode = self.filter_mode
         today = date.today()
         if mode == "today":
             return today, today
@@ -1593,11 +1640,12 @@ class HistoryPage(QWidget):
 
 
 class SettingsPage(QWidget):
-    def __init__(self, storage: Storage, back_cb, apply_overlay_cb, after_reset_cb, app_name_changed_cb):
+    def __init__(self, storage: Storage, back_cb, apply_overlay_cb, apply_hotkey_cb, after_reset_cb, app_name_changed_cb):
         super().__init__()
         self.storage = storage
         self.back_cb = back_cb
         self.apply_overlay_cb = apply_overlay_cb
+        self.apply_hotkey_cb = apply_hotkey_cb
         self.after_reset_cb = after_reset_cb
         self.app_name_changed_cb = app_name_changed_cb
         self._build_ui()
@@ -1640,6 +1688,32 @@ class SettingsPage(QWidget):
         self.app_name_edit.setPlaceholderText("Например: Учёт смен TaxiPro")
         app_name_layout.addWidget(self.app_name_edit)
         layout.addWidget(app_name_card)
+        hotkey_card = GlassCard()
+        hotkey_layout = QVBoxLayout(hotkey_card)
+        hotkey_layout.setContentsMargins(20, 20, 20, 20)
+        hotkey_layout.setSpacing(12)
+        hotkey_title = QLabel("⌨  Горячие клавиши")
+        hotkey_title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: 16px; font-weight: 700;")
+        hotkey_layout.addWidget(hotkey_title)
+        hotkey_hint = QLabel("Назначьте клавишу или комбинацию для быстрого свернуть/развернуть окна.")
+        hotkey_hint.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: 12px;")
+        hotkey_layout.addWidget(hotkey_hint)
+        hotkey_row = QHBoxLayout()
+        hotkey_row.setSpacing(12)
+        hotkey_label = QLabel("Свернуть/развернуть окно")
+        hotkey_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-weight: 600;")
+        hotkey_row.addWidget(hotkey_label)
+        hotkey_row.addStretch()
+        self.toggle_hotkey_edit = QKeySequenceEdit()
+        self.toggle_hotkey_edit.setClearButtonEnabled(True)
+        self.toggle_hotkey_edit.setFixedWidth(200)
+        hotkey_row.addWidget(self.toggle_hotkey_edit)
+        btn_hotkey_default = ShimmerButton("По умолчанию", kind="neutral")
+        btn_hotkey_default.setFixedHeight(32)
+        btn_hotkey_default.clicked.connect(self._reset_hotkey_default)
+        hotkey_row.addWidget(btn_hotkey_default)
+        hotkey_layout.addLayout(hotkey_row)
+        layout.addWidget(hotkey_card)
         comments_card = GlassCard()
         comments_layout = QVBoxLayout(comments_card)
         comments_layout.setContentsMargins(20, 20, 20, 20)
@@ -1783,6 +1857,7 @@ class SettingsPage(QWidget):
         self.expense_list.clear()
         for c in comm.get("expense", []):
             self.expense_list.addItem(c)
+        self.toggle_hotkey_edit.setKeySequence(QKeySequence(self.storage.get_toggle_hotkey()))
         o = self.storage.get_overlay_settings()
         self.chk_on_top.setChecked(o["always_on_top"])
         self.chk_frameless.setChecked(o["frameless"])
@@ -1804,10 +1879,17 @@ class SettingsPage(QWidget):
             opacity=self.spn_opacity.value(),
             frameless=self.chk_frameless.isChecked()
         )
+        hotkey = self.toggle_hotkey_edit.keySequence().toString(QKeySequence.NativeText)
+        self.storage.set_toggle_hotkey(hotkey)
         if self.app_name_changed_cb:
             self.app_name_changed_cb(self.storage.get_app_name())
         self.apply_overlay_cb()
+        if self.apply_hotkey_cb:
+            self.apply_hotkey_cb()
         QMessageBox.information(self, "Сохранено", "Настройки успешно сохранены.")
+
+    def _reset_hotkey_default(self):
+        self.toggle_hotkey_edit.setKeySequence(QKeySequence(DEFAULT_TOGGLE_HOTKEY))
 
     def _add_comment(self, is_income: bool):
         text, ok = QInputDialog.getText(self, "Добавить комментарий", "Название:")
@@ -1850,6 +1932,7 @@ class MainWindow(QMainWindow):
     def __init__(self, storage: Storage):
         super().__init__()
         self.storage = storage
+        self.toggle_shortcut: Optional[QShortcut] = None
         self.setWindowTitle(self.storage.get_app_name())
         self.setMinimumSize(900, 650)
         self.resize(1100, 750)
@@ -1861,6 +1944,7 @@ class MainWindow(QMainWindow):
             storage,
             back_cb=self.open_shift,
             apply_overlay_cb=self.apply_overlay_settings,
+            apply_hotkey_cb=self.apply_hotkey_settings,
             after_reset_cb=self.open_shift,
             app_name_changed_cb=self._on_app_name_changed
         )
@@ -1869,6 +1953,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.settings_page)
         self.open_shift()
         self.apply_overlay_settings()
+        self.apply_hotkey_settings()
 
     def open_shift(self):
         self.stack.setCurrentWidget(self.shift_page)
@@ -1892,6 +1977,25 @@ class MainWindow(QMainWindow):
         self.setWindowFlags(flags)
         self.setWindowOpacity(max(0.3, min(1.0, o["opacity"] / 100.0)))
         self.show()
+
+    def apply_hotkey_settings(self):
+        if self.toggle_shortcut is not None:
+            self.toggle_shortcut.setEnabled(False)
+            self.toggle_shortcut.deleteLater()
+            self.toggle_shortcut = None
+        sequence = self.storage.get_toggle_hotkey()
+        if sequence:
+            self.toggle_shortcut = QShortcut(QKeySequence(sequence), self)
+            self.toggle_shortcut.setContext(Qt.ApplicationShortcut)
+            self.toggle_shortcut.activated.connect(self._toggle_window_state)
+
+    def _toggle_window_state(self):
+        if self.windowState() & Qt.WindowMinimized:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+        else:
+            self.showMinimized()
 
     def _on_app_name_changed(self, name: str):
         clean = name or self.storage.get_app_name()
