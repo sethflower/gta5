@@ -1695,12 +1695,12 @@ class SettingsPage(QWidget):
         hotkey_title = QLabel("⌨  Горячие клавиши")
         hotkey_title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: 16px; font-weight: 700;")
         hotkey_layout.addWidget(hotkey_title)
-        hotkey_hint = QLabel("Назначьте клавишу или комбинацию для быстрого свернуть/развернуть окна.")
+        hotkey_hint = QLabel("Назначьте клавишу или комбинацию, чтобы быстро показать окно поверх игры.")
         hotkey_hint.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: 12px;")
         hotkey_layout.addWidget(hotkey_hint)
         hotkey_row = QHBoxLayout()
         hotkey_row.setSpacing(12)
-        hotkey_label = QLabel("Свернуть/развернуть окно")
+        hotkey_label = QLabel("Показать/скрыть поверх игры")
         hotkey_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-weight: 600;")
         hotkey_row.addWidget(hotkey_label)
         hotkey_row.addStretch()
@@ -1990,12 +1990,17 @@ class MainWindow(QMainWindow):
             self.toggle_shortcut.activated.connect(self._toggle_window_state)
 
     def _toggle_window_state(self):
-        if self.windowState() & Qt.WindowMinimized:
-            self.showNormal()
+        o = self.storage.get_overlay_settings()
+        flags = Qt.Window
+        if o["frameless"]:
+            flags |= Qt.FramelessWindowHint
+        if self.windowFlags() & Qt.WindowStaysOnTopHint:
+            self.setWindowFlags(flags)
+        else:
+            self.setWindowFlags(flags | Qt.WindowStaysOnTopHint)
             self.raise_()
             self.activateWindow()
-        else:
-            self.showMinimized()
+        self.show()
 
     def _on_app_name_changed(self, name: str):
         clean = name or self.storage.get_app_name()
