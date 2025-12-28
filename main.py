@@ -18,7 +18,20 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 
 from PySide6.QtCore import Qt, QTimer, QStandardPaths, QRectF, Signal, QDate
-from PySide6.QtGui import QFont, QAction, QCursor, QPainter, QLinearGradient, QColor, QPen, QKeyEvent, QKeySequence, QShortcut
+from PySide6.QtGui import (
+    QFont,
+    QAction,
+    QCursor,
+    QPainter,
+    QLinearGradient,
+    QColor,
+    QPen,
+    QKeyEvent,
+    QKeySequence,
+    QShortcut,
+    QPixmap,
+    QIcon,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -41,6 +54,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QDateEdit,
     QKeySequenceEdit,
+    QFileDialog,
+    QGraphicsOpacityEffect,
 )
 
 
@@ -154,6 +169,7 @@ class Shift:
     start_ts: str
     end_ts: Optional[str]
     operations: List[Operation]
+    last_balance: Optional[int] = None
 
     def income(self) -> int:
         return sum(op.amount for op in self.operations if op.amount > 0)
@@ -182,6 +198,9 @@ def default_data() -> Dict[str, Any]:
             "overlay_frameless": False,
             "app_name": "Калькулятор таксиста",
             "toggle_hotkey": DEFAULT_TOGGLE_HOTKEY,
+            "app_icon_path": "",
+            "shift_background_path": "",
+            "shift_background_opacity": 35,
         },
         "shifts": [],
         "active_shift_id": None,
@@ -216,6 +235,9 @@ class Storage:
         s.setdefault("overlay_frameless", False)
         s.setdefault("toggle_hotkey", DEFAULT_TOGGLE_HOTKEY)
         s.setdefault("app_name", "Калькулятор таксиста")
+        s.setdefault("app_icon_path", "")
+        s.setdefault("shift_background_path", "")
+        s.setdefault("shift_background_opacity", 35)
         self.save()
         return self.data
 
@@ -229,12 +251,26 @@ class Storage:
         out: List[Shift] = []
         for sd in self.data.get("shifts", []):
             ops = [Operation(**od) for od in sd.get("operations", [])]
-            out.append(Shift(id=sd["id"], start_ts=sd["start_ts"], end_ts=sd.get("end_ts"), operations=ops))
+            out.append(
+                Shift(
+                    id=sd["id"],
+                    start_ts=sd["start_ts"],
+                    end_ts=sd.get("end_ts"),
+                    operations=ops,
+                    last_balance=sd.get("last_balance"),
+                )
+            )
         return out
 
     def _save_shifts(self, shifts: List[Shift]) -> None:
         self.data["shifts"] = [
-            {"id": s.id, "start_ts": s.start_ts, "end_ts": s.end_ts, "operations": [asdict(op) for op in s.operations]}
+            {
+                "id": s.id,
+                "start_ts": s.start_ts,
+                "end_ts": s.end_ts,
+                "operations": [asdict(op) for op in s.operations],
+                "last_balance": s.last_balance,
+            }
             for s in shifts
         ]
         self.save()
@@ -246,7 +282,7 @@ class Storage:
             for s in shifts:
                 if s.id == sid:
                     return s
-        new_shift = Shift(id=str(uuid.uuid4()), start_ts=now_iso(), end_ts=None, operations=[])
+        new_shift = Shift(id=str(uuid.uuid4()), start_ts=now_iso(), end_ts=None, operations=[], last_balance=None)
         shifts.append(new_shift)
         self._save_shifts(shifts)
         self.data["active_shift_id"] = new_shift.id
@@ -268,7 +304,7 @@ class Storage:
         if current.end_ts is None:
             current.end_ts = now_iso()
             self.update_shift(current)
-        new_shift = Shift(id=str(uuid.uuid4()), start_ts=now_iso(), end_ts=None, operations=[])
+        new_shift = Shift(id=str(uuid.uuid4()), start_ts=now_iso(), end_ts=None, operations=[], last_balance=None)
         shifts = self.shifts()
         shifts.append(new_shift)
         self._save_shifts(shifts)
@@ -279,13 +315,16 @@ class Storage:
     def reset_current_shift_operations(self) -> Shift:
         current = self.get_active_shift()
         current.operations = []
+        current.last_balance = None
         self.update_shift(current)
         return current
 
-    def add_operation_to_active(self, amount: int, comment: str) -> Operation:
+    def add_operation_to_active(self, amount: int, comment: str, new_balance: Optional[int] = None) -> Operation:
         current = self.get_active_shift()
         op = Operation(id=str(uuid.uuid4()), ts=now_iso(), amount=amount, comment=comment)
         current.operations.append(op)
+        if new_balance is not None:
+            current.last_balance = new_balance
         self.update_shift(current)
         return op
 
@@ -293,13 +332,19 @@ class Storage:
         shifts = self.shifts()
         for s in shifts:
             if s.id == shift_id:
+                last_op_id = s.operations[-1].id if s.operations else None
                 s.operations = [op for op in s.operations if op.id != op_id]
+                if op_id == last_op_id:
+                    s.last_balance = None
                 self.update_shift(s)
                 return
 
     def delete_operation_from_active(self, op_id: str) -> None:
         current = self.get_active_shift()
+        last_op_id = current.operations[-1].id if current.operations else None
         current.operations = [op for op in current.operations if op.id != op_id]
+        if op_id == last_op_id:
+            current.last_balance = None
         self.update_shift(current)
 
     def find_operation(self, op_id: str) -> Optional[Tuple[Shift, Operation]]:
@@ -346,6 +391,20 @@ class Storage:
         if not clean:
             clean = "Калькулятор таксиста"
         self.data["settings"]["app_name"] = clean
+        self.save()
+
+    def get_appearance_settings(self) -> Dict[str, Any]:
+        settings = self.data["settings"]
+        return {
+            "app_icon_path": str(settings.get("app_icon_path", "") or ""),
+            "shift_background_path": str(settings.get("shift_background_path", "") or ""),
+            "shift_background_opacity": int(settings.get("shift_background_opacity", 35)),
+        }
+
+    def set_appearance_settings(self, app_icon_path: str, shift_background_path: str, shift_background_opacity: int) -> None:
+        self.data["settings"]["app_icon_path"] = str(app_icon_path or "").strip()
+        self.data["settings"]["shift_background_path"] = str(shift_background_path or "").strip()
+        self.data["settings"]["shift_background_opacity"] = int(shift_background_opacity)
         self.save()
 
     def get_shift_numbers_map(self) -> Dict[str, int]:
@@ -1093,9 +1152,12 @@ class ShiftPage(QWidget):
         self.storage = storage
         self.open_history_cb = open_history_cb
         self.open_settings_cb = open_settings_cb
+        self.shift_bg_path = ""
         self._build_ui()
         self._load_active_shift()
         self.set_app_name(self.storage.get_app_name())
+        appearance = self.storage.get_appearance_settings()
+        self.set_shift_background(appearance["shift_background_path"], appearance["shift_background_opacity"])
 
     def _build_ui(self):
         scroll = QScrollArea()
@@ -1147,11 +1209,11 @@ class ShiftPage(QWidget):
         form_layout = QVBoxLayout(form_card)
         form_layout.setContentsMargins(20, 20, 20, 20)
         form_layout.setSpacing(14)
-        form_title = QLabel("Новая операция")
+        form_title = QLabel("Текущая сумма")
         form_title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: 16px; font-weight: 700;")
         form_layout.addWidget(form_title)
         self.amount_edit = QLineEdit()
-        self.amount_edit.setPlaceholderText("Сумма (например: 1500 или -300)")
+        self.amount_edit.setPlaceholderText("Сумма на руках сейчас (например: 1500)")
         self.amount_edit.textChanged.connect(self._on_amount_changed)
         self.amount_edit.returnPressed.connect(self._focus_comment)
         form_layout.addWidget(self.amount_edit)
@@ -1172,6 +1234,14 @@ class ShiftPage(QWidget):
         left.addStretch()
         content.addLayout(left, 1)
         right_card = GlassCard()
+        self.right_card = right_card
+        self.shift_bg_label = QLabel(self.right_card)
+        self.shift_bg_label.setScaledContents(True)
+        self.shift_bg_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.shift_bg_label.lower()
+        self.shift_bg_opacity = QGraphicsOpacityEffect(self.shift_bg_label)
+        self.shift_bg_opacity.setOpacity(0.35)
+        self.shift_bg_label.setGraphicsEffect(self.shift_bg_opacity)
         right_layout = QVBoxLayout(right_card)
         right_layout.setContentsMargins(20, 20, 20, 20)
         right_layout.setSpacing(12)
@@ -1230,6 +1300,33 @@ class ShiftPage(QWidget):
                 return
         super().keyPressEvent(event)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_shift_background_geometry()
+
+    def set_shift_background(self, path: str, opacity: int):
+        self.shift_bg_path = (path or "").strip()
+        clamped_opacity = max(0, min(100, int(opacity)))
+        self.shift_bg_opacity.setOpacity(clamped_opacity / 100.0)
+        if not self.shift_bg_path or not Path(self.shift_bg_path).exists():
+            self.shift_bg_label.clear()
+            self.shift_bg_label.hide()
+            return
+        pixmap = QPixmap(self.shift_bg_path)
+        if pixmap.isNull():
+            self.shift_bg_label.clear()
+            self.shift_bg_label.hide()
+            return
+        self.shift_bg_label.setPixmap(pixmap)
+        self.shift_bg_label.show()
+        self._update_shift_background_geometry()
+
+    def _update_shift_background_geometry(self):
+        if not hasattr(self, "right_card"):
+            return
+        rect = self.right_card.rect()
+        self.shift_bg_label.setGeometry(rect)
+
     def _focus_comment(self):
         if self.comment_combo.isEnabled() and self.comment_combo.count() > 1:
             self.comment_combo.setFocus()
@@ -1287,17 +1384,25 @@ class ShiftPage(QWidget):
     def _on_amount_changed(self):
         amt = parse_amount(self.amount_edit.text())
         self.comment_combo.clear()
-        if amt is None or amt == 0:
+        if amt is None:
             self.comment_combo.addItem("Введите сумму")
             self.comment_combo.setEnabled(False)
             return
+        if self.active_shift.last_balance is None:
+            self.comment_combo.addItem("Стартовая сумма")
+            self.comment_combo.setEnabled(False)
+            return
+        delta = amt - self.active_shift.last_balance
+        if delta == 0:
+            self.comment_combo.addItem("Сумма не изменилась")
+            self.comment_combo.setEnabled(False)
+            return
         comments = self.storage.get_comments()
-        if amt > 0:
+        if delta > 0:
             choices = comments.get("income", [])
-            self.comment_combo.addItem("— Выберите комментарий —")
         else:
             choices = comments.get("expense", [])
-            self.comment_combo.addItem("— Выберите комментарий —")
+        self.comment_combo.addItem("— Выберите комментарий —")
         for c in choices:
             self.comment_combo.addItem(c)
         self.comment_combo.addItem(OTHER_COMMENT_TEXT)
@@ -1305,8 +1410,22 @@ class ShiftPage(QWidget):
 
     def _save_operation(self):
         amt = parse_amount(self.amount_edit.text())
-        if amt is None or amt == 0:
-            QMessageBox.warning(self, "Ошибка", "Введите корректную сумму (не 0).")
+        if amt is None:
+            QMessageBox.warning(self, "Ошибка", "Введите корректную сумму.")
+            self.amount_edit.setFocus()
+            return
+        if self.active_shift.last_balance is None:
+            self.active_shift.last_balance = amt
+            self.storage.update_shift(self.active_shift)
+            self._render_shift()
+            self._update_all_time()
+            self.amount_edit.clear()
+            self.amount_edit.setFocus()
+            self._on_amount_changed()
+            return
+        delta = amt - self.active_shift.last_balance
+        if delta == 0:
+            QMessageBox.warning(self, "Ошибка", "Сумма не изменилась. Операция не добавлена.")
             self.amount_edit.setFocus()
             return
         if not self.comment_combo.isEnabled() or self.comment_combo.currentIndex() <= 0:
@@ -1323,7 +1442,7 @@ class ShiftPage(QWidget):
                 return
         else:
             comment = chosen
-        self.storage.add_operation_to_active(amt, comment)
+        self.storage.add_operation_to_active(delta, comment, new_balance=amt)
         self.active_shift = self.storage.get_active_shift()
         self._render_shift()
         self._update_all_time()
@@ -1640,12 +1759,22 @@ class HistoryPage(QWidget):
 
 
 class SettingsPage(QWidget):
-    def __init__(self, storage: Storage, back_cb, apply_overlay_cb, apply_hotkey_cb, after_reset_cb, app_name_changed_cb):
+    def __init__(
+        self,
+        storage: Storage,
+        back_cb,
+        apply_overlay_cb,
+        apply_hotkey_cb,
+        apply_appearance_cb,
+        after_reset_cb,
+        app_name_changed_cb,
+    ):
         super().__init__()
         self.storage = storage
         self.back_cb = back_cb
         self.apply_overlay_cb = apply_overlay_cb
         self.apply_hotkey_cb = apply_hotkey_cb
+        self.apply_appearance_cb = apply_appearance_cb
         self.after_reset_cb = after_reset_cb
         self.app_name_changed_cb = app_name_changed_cb
         self._build_ui()
@@ -1800,6 +1929,68 @@ class SettingsPage(QWidget):
         note.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 12px;")
         comments_layout.addWidget(note)
         layout.addWidget(comments_card)
+        appearance_card = GlassCard()
+        appearance_layout = QVBoxLayout(appearance_card)
+        appearance_layout.setContentsMargins(20, 20, 20, 20)
+        appearance_layout.setSpacing(12)
+        appearance_title = QLabel("🖼  Оформление")
+        appearance_title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: 16px; font-weight: 700;")
+        appearance_layout.addWidget(appearance_title)
+        icon_row = QHBoxLayout()
+        icon_row.setSpacing(10)
+        icon_label = QLabel("Иконка приложения")
+        icon_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-weight: 600;")
+        icon_row.addWidget(icon_label)
+        icon_row.addStretch()
+        appearance_layout.addLayout(icon_row)
+        icon_input_row = QHBoxLayout()
+        icon_input_row.setSpacing(8)
+        self.app_icon_edit = QLineEdit()
+        self.app_icon_edit.setPlaceholderText("Путь к файлу иконки (.png/.ico)")
+        icon_input_row.addWidget(self.app_icon_edit, 1)
+        btn_icon_choose = ShimmerButton("Выбрать", kind="neutral")
+        btn_icon_choose.setFixedWidth(110)
+        btn_icon_choose.clicked.connect(self._choose_app_icon)
+        icon_input_row.addWidget(btn_icon_choose)
+        btn_icon_clear = ShimmerButton("Очистить", kind="danger")
+        btn_icon_clear.setFixedWidth(110)
+        btn_icon_clear.clicked.connect(self._clear_app_icon)
+        icon_input_row.addWidget(btn_icon_clear)
+        appearance_layout.addLayout(icon_input_row)
+        bg_row = QHBoxLayout()
+        bg_row.setSpacing(10)
+        bg_label = QLabel("Фоновая заставка для «Операции смены»")
+        bg_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-weight: 600;")
+        bg_row.addWidget(bg_label)
+        bg_row.addStretch()
+        appearance_layout.addLayout(bg_row)
+        bg_input_row = QHBoxLayout()
+        bg_input_row.setSpacing(8)
+        self.shift_bg_edit = QLineEdit()
+        self.shift_bg_edit.setPlaceholderText("Путь к изображению (jpg/png)")
+        bg_input_row.addWidget(self.shift_bg_edit, 1)
+        btn_bg_choose = ShimmerButton("Выбрать", kind="neutral")
+        btn_bg_choose.setFixedWidth(110)
+        btn_bg_choose.clicked.connect(self._choose_shift_background)
+        bg_input_row.addWidget(btn_bg_choose)
+        btn_bg_clear = ShimmerButton("Очистить", kind="danger")
+        btn_bg_clear.setFixedWidth(110)
+        btn_bg_clear.clicked.connect(self._clear_shift_background)
+        bg_input_row.addWidget(btn_bg_clear)
+        appearance_layout.addLayout(bg_input_row)
+        bg_opacity_row = QHBoxLayout()
+        bg_opacity_row.setSpacing(10)
+        bg_opacity_label = QLabel("Прозрачность заставки")
+        bg_opacity_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-weight: 600;")
+        bg_opacity_row.addWidget(bg_opacity_label)
+        self.shift_bg_opacity = QSpinBox()
+        self.shift_bg_opacity.setRange(0, 100)
+        self.shift_bg_opacity.setSuffix(" %")
+        self.shift_bg_opacity.setFixedWidth(120)
+        bg_opacity_row.addWidget(self.shift_bg_opacity)
+        bg_opacity_row.addStretch()
+        appearance_layout.addLayout(bg_opacity_row)
+        layout.addWidget(appearance_card)
         overlay_card = GlassCard()
         overlay_layout = QVBoxLayout(overlay_card)
         overlay_layout.setContentsMargins(20, 20, 20, 20)
@@ -1862,6 +2053,10 @@ class SettingsPage(QWidget):
         self.chk_on_top.setChecked(o["always_on_top"])
         self.chk_frameless.setChecked(o["frameless"])
         self.spn_opacity.setValue(o["opacity"])
+        appearance = self.storage.get_appearance_settings()
+        self.app_icon_edit.setText(appearance["app_icon_path"])
+        self.shift_bg_edit.setText(appearance["shift_background_path"])
+        self.shift_bg_opacity.setValue(appearance["shift_background_opacity"])
 
     def _save(self):
         self.storage.set_app_name(self.app_name_edit.text())
@@ -1879,14 +2074,37 @@ class SettingsPage(QWidget):
             opacity=self.spn_opacity.value(),
             frameless=self.chk_frameless.isChecked()
         )
+        self.storage.set_appearance_settings(
+            self.app_icon_edit.text(),
+            self.shift_bg_edit.text(),
+            self.shift_bg_opacity.value(),
+        )
         hotkey = self.toggle_hotkey_edit.keySequence().toString(QKeySequence.NativeText)
         self.storage.set_toggle_hotkey(hotkey)
         if self.app_name_changed_cb:
             self.app_name_changed_cb(self.storage.get_app_name())
         self.apply_overlay_cb()
+        if self.apply_appearance_cb:
+            self.apply_appearance_cb()
         if self.apply_hotkey_cb:
             self.apply_hotkey_cb()
         QMessageBox.information(self, "Сохранено", "Настройки успешно сохранены.")
+
+    def _choose_app_icon(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Выбрать иконку", "", "Изображения (*.png *.ico *.jpg *.jpeg)")
+        if path:
+            self.app_icon_edit.setText(path)
+
+    def _clear_app_icon(self):
+        self.app_icon_edit.clear()
+
+    def _choose_shift_background(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Выбрать заставку", "", "Изображения (*.png *.jpg *.jpeg)")
+        if path:
+            self.shift_bg_edit.setText(path)
+
+    def _clear_shift_background(self):
+        self.shift_bg_edit.clear()
 
     def _reset_hotkey_default(self):
         self.toggle_hotkey_edit.setKeySequence(QKeySequence(DEFAULT_TOGGLE_HOTKEY))
@@ -1945,6 +2163,7 @@ class MainWindow(QMainWindow):
             back_cb=self.open_shift,
             apply_overlay_cb=self.apply_overlay_settings,
             apply_hotkey_cb=self.apply_hotkey_settings,
+            apply_appearance_cb=self.apply_appearance_settings,
             after_reset_cb=self.open_shift,
             app_name_changed_cb=self._on_app_name_changed
         )
@@ -1954,6 +2173,7 @@ class MainWindow(QMainWindow):
         self.open_shift()
         self.apply_overlay_settings()
         self.apply_hotkey_settings()
+        self.apply_appearance_settings()
 
     def open_shift(self):
         self.stack.setCurrentWidget(self.shift_page)
@@ -1988,6 +2208,26 @@ class MainWindow(QMainWindow):
             self.toggle_shortcut = QShortcut(QKeySequence(sequence), self)
             self.toggle_shortcut.setContext(Qt.ApplicationShortcut)
             self.toggle_shortcut.activated.connect(self._toggle_window_state)
+
+    def apply_appearance_settings(self):
+        appearance = self.storage.get_appearance_settings()
+        icon_path = appearance["app_icon_path"]
+        if icon_path and Path(icon_path).exists():
+            icon = QIcon(icon_path)
+            if not icon.isNull():
+                self.setWindowIcon(icon)
+                app = QApplication.instance()
+                if app is not None:
+                    app.setWindowIcon(icon)
+        else:
+            self.setWindowIcon(QIcon())
+            app = QApplication.instance()
+            if app is not None:
+                app.setWindowIcon(QIcon())
+        self.shift_page.set_shift_background(
+            appearance["shift_background_path"],
+            appearance["shift_background_opacity"],
+        )
 
     def _toggle_window_state(self):
         if self.windowState() & Qt.WindowMinimized:
